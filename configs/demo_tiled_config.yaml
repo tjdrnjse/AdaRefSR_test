@@ -1,0 +1,29 @@
+# ── Model paths (same as demo_config.yaml) ──────────────────────────────────
+sd_path:                  "your_code_path/model/stabilityai/sd-turbo"
+pretrained_backbone_path: "your_code_path/model/zhangap/S3Diff/s3diff.pkl"
+pretrained_ref_gen_path:  "your_code_path/model/adarefsr.pkl"
+de_net_path:              "your_code_path/assets/mm-realsr/de_net.pth"
+ram_path:                 "your_code_path/model/xinyu1205/recognize-anything/ram_swin_large_14m.pth"
+dape_path:                "your_code_path/model/DAPE/DAPE.pth"
+
+# ── Base inference settings ──────────────────────────────────────────────────
+mixed_precision: "fp16"
+fusion_blocks:   "full"
+align_method:    "wavelet"
+is_image:        True
+enable_xformers: True
+
+# ── Tiling settings ──────────────────────────────────────────────────────────
+# tile_size: H=W of each tile sent to the model.
+#   - Set to the model's native resolution (512 by default).
+#   - Smaller values reduce VRAM but may hurt quality.
+tile_size: 512
+
+# tile_overlap: overlap in pixels between adjacent tiles.
+#   - Larger overlap → smoother seams, more compute.
+#   - Recommended range: 32–128.  Use ≥ 64 for best quality.
+tile_overlap: 64
+
+# tile_batch_size: number of tiles processed together on the GPU.
+#   - Increase if you have enough VRAM; decrease if you run out of memory.
+tile_batch_size: 4
