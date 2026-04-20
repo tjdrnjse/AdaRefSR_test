@@ -1,3 +1,10 @@
+# ── I/O paths (can be overridden by CLI --lq_path / --ref_path / --output_path) ──
+# 단일 파일: 파일 경로를 직접 지정
+# 폴더 배치: 폴더 경로를 지정하면 동일 파일명으로 자동 매칭
+lq_path:     null   # 예) "./assets/lq/img.png"  또는  "./assets/lq/"
+ref_path:    null   # 예) "./assets/ref/img.png"  또는  "./assets/ref/"
+output_path: null   # 예) "./assets/results/img.png"  또는  "./assets/results/"
+
 # ── Model paths (same as demo_config.yaml) ──────────────────────────────────
 sd_path:                  "your_code_path/model/stabilityai/sd-turbo"
 pretrained_backbone_path: "your_code_path/model/zhangap/S3Diff/s3diff.pkl"

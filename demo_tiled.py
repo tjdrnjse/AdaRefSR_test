@@ -27,6 +27,8 @@ ram_transforms = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
+SUPPORTED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'}
+
 
 # ── Tiling utilities ────────────────────────────────────────────────────────
 
@@ -61,6 +63,17 @@ def tile_start_coords(total, tile_size, overlap):
     if not coords or coords[-1] != last:
         coords.append(last)
     return coords
+
+
+# ── Image collection ─────────────────────────────────────────────────────────
+
+def collect_image_files(folder):
+    """Return sorted list of image filenames in folder (extension filter applied)."""
+    files = sorted(
+        f for f in os.listdir(folder)
+        if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+    )
+    return files
 
 
 # ── Main inference ───────────────────────────────────────────────────────────
@@ -113,18 +126,11 @@ def infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
     return predictions
 
 
-def run_demo_tiled(lq_path, ref_path, output_path, args):
-    accelerator  = Accelerator(mixed_precision=args.mixed_precision)
-    device       = accelerator.device
-    weight_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.float32
-
-    tile_size = int(args.get("tile_size",       512))
-    overlap   = int(args.get("tile_overlap",     64))
-    batch_sz  = int(args.get("tile_batch_size",   4))
-
-    # ── Load models ──────────────────────────────────────────────────────────
-    net_sr, net_ref, net_de, model_vlm, model_vlm_deg, ref_writer, ref_reader = \
-        load_models(args, device, weight_dtype)
+def _infer_single_image(lq_path, ref_path, output_path,
+                        net_sr, net_ref, net_de, model_vlm, model_vlm_deg,
+                        ref_writer, ref_reader, args, device, weight_dtype,
+                        tile_size, overlap, batch_sz):
+    """Process a single (lq, ref) image pair and save the result."""
 
     # ── Preprocess images ────────────────────────────────────────────────────
     lq_img  = Image.open(lq_path).convert("RGB")
@@ -147,12 +153,12 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
             ram_transforms(x_ref.unsqueeze(0)).to(device, dtype=torch.float16), model_vlm)
         prompt_src = inference(
             ram_transforms(x_lq.unsqueeze(0)).to(device,  dtype=torch.float16), model_vlm_deg)
-    print(f">>> Prompt (ref): {prompt_ref}")
-    print(f">>> Prompt (src): {prompt_src}")
+    print(f"  Prompt (ref): {prompt_ref}")
+    print(f"  Prompt (src): {prompt_src}")
 
     # ── Single-tile fast-path (image already fits in one tile) ───────────────
     if lq_h <= tile_size and lq_w <= tile_size:
-        print(">>> Image fits in one tile – running single inference.")
+        print("  Image fits in one tile – running single inference.")
         x_src_t = x_lq.unsqueeze(0).to(device, dtype=weight_dtype)
         x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
         preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
@@ -161,7 +167,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
         if args.get('align_method', 'wavelet') == 'wavelet':
             pred_img = wavelet_color_fix(pred_img, lq_img)
         pred_img.resize((orig_w, orig_h), Image.BICUBIC).save(output_path)
-        print(f"✅ Result saved to: {output_path}")
+        print(f"  Saved: {output_path}")
         return
 
     # ── Build tile grid ───────────────────────────────────────────────────────
@@ -169,8 +175,8 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
     xs = tile_start_coords(lq_w, tile_size, overlap)
     all_tiles = [(y, x) for y in ys for x in xs]
     n_tiles    = len(all_tiles)
-    print(f">>> Grid: {lq_h}×{lq_w} → {len(ys)}×{len(xs)} = {n_tiles} tiles "
-          f"(tile_size={tile_size}, overlap={overlap}, batch={batch_sz})")
+    print(f"  Grid: {lq_h}x{lq_w} -> {len(ys)}x{len(xs)} = {n_tiles} tiles "
+          f"(tile={tile_size}, overlap={overlap}, batch={batch_sz})")
 
     # Output accumulators (float32 for precision)
     pred_acc   = torch.zeros(3, lq_h, lq_w, dtype=torch.float32, device=device)
@@ -180,16 +186,13 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
     for batch_start in range(0, n_tiles, batch_sz):
         batch_pos = all_tiles[batch_start : batch_start + batch_sz]
         B = len(batch_pos)
-        print(f"    tiles {batch_start + 1}–{batch_start + B} / {n_tiles}")
+        print(f"    tiles {batch_start + 1}-{batch_start + B} / {n_tiles}")
 
         lq_tiles  = []
         ref_tiles = []
         for (ty, tx) in batch_pos:
-            # LQ tile (always tile_size × tile_size due to grid construction)
             lq_tiles.append(x_lq[:, ty:ty + tile_size, tx:tx + tile_size])
 
-            # Ref tile: extract a proportionally corresponding region, then
-            # resize to tile_size so the model always sees the expected input shape.
             ry  = int(ty * ref_h / lq_h)
             rx  = int(tx * ref_w / lq_w)
             rth = max(1, round(tile_size * ref_h / lq_h))
@@ -205,10 +208,9 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
                 ).squeeze(0)
             ref_tiles.append(ref_crop)
 
-        x_src_b = torch.stack(lq_tiles).to(device, dtype=weight_dtype)   # [B, 3, ts, ts]
+        x_src_b = torch.stack(lq_tiles).to(device, dtype=weight_dtype)
         x_ref_b = torch.stack(ref_tiles).to(device, dtype=weight_dtype)
 
-        # Repeat global prompts for each item in the batch
         prompts_ref_b = [prompt_ref] * B
         prompts_src_b = [prompt_src] * B
 
@@ -217,10 +219,9 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
             x_src_b, x_ref_b, prompts_src_b, prompts_ref_b, weight_dtype,
         )
 
-        # Weighted accumulation
         for k, (ty, tx) in enumerate(batch_pos):
             w    = tile_weight_map(tile_size, overlap, ty, tx, lq_h, lq_w).to(device)
-            pred = (predictions[k] * 0.5 + 0.5).clamp(0, 1).float()   # [3, ts, ts]
+            pred = (predictions[k] * 0.5 + 0.5).clamp(0, 1).float()
             pred_acc[:,   ty:ty + tile_size, tx:tx + tile_size] += pred * w
             weight_acc[:, ty:ty + tile_size, tx:tx + tile_size] += w
 
@@ -230,7 +231,102 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
     if args.get('align_method', 'wavelet') == 'wavelet':
         result_img = wavelet_color_fix(result_img, lq_img)
     result_img.resize((orig_w, orig_h), Image.BICUBIC).save(output_path)
-    print(f"✅ Result saved to: {output_path}")
+    print(f"  Saved: {output_path}")
+
+
+def run_demo_tiled(lq_path, ref_path, output_path, args):
+    """
+    폴더 경로가 주어지면 lq_path / ref_path 안의 동일 파일명 이미지를 전부 처리.
+    파일 경로가 주어지면 단일 이미지 처리 (기존 동작).
+
+    output_path:
+      - 단일 모드: 저장할 파일 경로 (예: ./result.png)
+      - 폴더 모드: 결과를 저장할 폴더 경로 (없으면 자동 생성)
+    """
+    accelerator  = Accelerator(mixed_precision=args.mixed_precision)
+    device       = accelerator.device
+    weight_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.float32
+
+    tile_size = int(args.get("tile_size",       512))
+    overlap   = int(args.get("tile_overlap",     64))
+    batch_sz  = int(args.get("tile_batch_size",   4))
+
+    lq_is_dir  = os.path.isdir(lq_path)
+    ref_is_dir = os.path.isdir(ref_path)
+
+    # ── 처리 대상 쌍 목록 구성 ────────────────────────────────────────────────
+    if lq_is_dir and ref_is_dir:
+        # 폴더 모드: 동일 파일명으로 매칭
+        lq_files = collect_image_files(lq_path)
+        if not lq_files:
+            raise FileNotFoundError(f"No image files found in lq_path: {lq_path}")
+
+        image_pairs = []
+        skipped = []
+        for fname in lq_files:
+            ref_file = os.path.join(ref_path, fname)
+            if not os.path.exists(ref_file):
+                skipped.append(fname)
+                continue
+            image_pairs.append((
+                os.path.join(lq_path, fname),
+                ref_file,
+                os.path.join(output_path, fname),
+            ))
+
+        if skipped:
+            print(f"[WARNING] {len(skipped)} file(s) skipped (no matching ref): {skipped}")
+        if not image_pairs:
+            raise FileNotFoundError(
+                "No matching (lq, ref) pairs found. "
+                "Make sure lq and ref folders contain images with identical filenames."
+            )
+
+        os.makedirs(output_path, exist_ok=True)
+        print(f">>> Folder mode: {len(image_pairs)} image pair(s) found.")
+        print(f"    lq_path    : {lq_path}")
+        print(f"    ref_path   : {ref_path}")
+        print(f"    output_path: {output_path}")
+
+    elif not lq_is_dir and not ref_is_dir:
+        # 단일 파일 모드
+        # output_path 가 디렉토리면 파일명 자동 결정
+        if os.path.isdir(output_path):
+            fname = os.path.basename(lq_path)
+            out_file = os.path.join(output_path, fname)
+        else:
+            out_dir = os.path.dirname(output_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            out_file = output_path
+
+        image_pairs = [(lq_path, ref_path, out_file)]
+        print(f">>> Single-image mode: {os.path.basename(lq_path)}")
+
+    else:
+        raise ValueError(
+            "lq_path and ref_path must both be files or both be directories. "
+            f"Got lq_is_dir={lq_is_dir}, ref_is_dir={ref_is_dir}"
+        )
+
+    # ── 모델 로드 (전체 처리에 걸쳐 한 번만) ─────────────────────────────────
+    print(">>> Loading models...")
+    net_sr, net_ref, net_de, model_vlm, model_vlm_deg, ref_writer, ref_reader = \
+        load_models(args, device, weight_dtype)
+    print(">>> Models loaded.")
+
+    # ── 이미지 쌍 순차 처리 ──────────────────────────────────────────────────
+    n_total = len(image_pairs)
+    for idx, (lq_f, ref_f, out_f) in enumerate(image_pairs, 1):
+        print(f"\n[{idx}/{n_total}] {os.path.basename(lq_f)}")
+        _infer_single_image(
+            lq_f, ref_f, out_f,
+            net_sr, net_ref, net_de, model_vlm, model_vlm_deg,
+            ref_writer, ref_reader,
+            args, device, weight_dtype, tile_size, overlap, batch_sz,
+        )
+
+    print(f"\n>>> All done. {n_total} image(s) processed.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -238,16 +334,19 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
 if __name__ == "__main__":
     demo_parser = argparse.ArgumentParser(add_help=False)
     demo_parser.add_argument("--config",          type=str, default="./configs/demo_tiled_config.yaml")
-    demo_parser.add_argument("--lq_path",         type=str, required=True)
-    demo_parser.add_argument("--ref_path",        type=str, required=True)
-    demo_parser.add_argument("--output_path",     type=str, default="./assets/pic/result_tiled.png")
-    demo_parser.add_argument("--tile_size",       type=int, default=512,
-                             help="Tile height=width in pixels. Should match the model's "
-                                  "native resolution (default 512).")
-    demo_parser.add_argument("--tile_overlap",    type=int, default=64,
-                             help="Overlap between adjacent tiles in pixels. "
-                                  "Larger values reduce seam artifacts but increase compute.")
-    demo_parser.add_argument("--tile_batch_size", type=int, default=4,
+    demo_parser.add_argument("--lq_path",         type=str, default=None,
+                             help="LQ image file or folder. Can also be set in YAML.")
+    demo_parser.add_argument("--ref_path",        type=str, default=None,
+                             help="Ref image file or folder (filenames must match lq). "
+                                  "Can also be set in YAML.")
+    demo_parser.add_argument("--output_path",     type=str, default=None,
+                             help="Output file path (single mode) or folder (batch mode). "
+                                  "Can also be set in YAML.")
+    demo_parser.add_argument("--tile_size",       type=int, default=None,
+                             help="Tile height=width in pixels (default: from YAML or 512).")
+    demo_parser.add_argument("--tile_overlap",    type=int, default=None,
+                             help="Overlap between adjacent tiles in pixels.")
+    demo_parser.add_argument("--tile_batch_size", type=int, default=None,
                              help="Number of tiles processed per GPU batch.")
 
     demo_args, unknown = demo_parser.parse_known_args()
@@ -261,5 +360,16 @@ if __name__ == "__main__":
         base_cfg = OmegaConf.merge(base_cfg, yaml_cfg)
         print(f">>> Loaded YAML config from {demo_args.config}")
 
-    final_cfg = OmegaConf.merge(base_cfg, OmegaConf.create(vars(demo_args)))
+    # CLI 인수 중 None이 아닌 것만 덮어씀 (YAML 값 우선, CLI가 최우선)
+    cli_overrides = {k: v for k, v in vars(demo_args).items()
+                     if v is not None and k != 'config'}
+    final_cfg = OmegaConf.merge(base_cfg, OmegaConf.create(cli_overrides))
+
+    # 필수 경로 확인
+    for key in ('lq_path', 'ref_path', 'output_path'):
+        if not final_cfg.get(key):
+            raise ValueError(
+                f"'{key}' is required. Set it via --{key} or in the YAML config."
+            )
+
     run_demo_tiled(final_cfg.lq_path, final_cfg.ref_path, final_cfg.output_path, final_cfg)
