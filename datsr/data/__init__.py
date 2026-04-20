@@ -2,7 +2,7 @@ import importlib
 import logging
 import os.path as osp
 
-import mmcv
+from mmengine.utils import scandir
 import torch
 import torch.utils.data
 
@@ -12,7 +12,7 @@ __all__ = ['create_dataset', 'create_dataloader']
 # scan all the files under the data folder with '_dataset' in file names
 data_folder = osp.dirname(osp.abspath(__file__))
 dataset_filenames = [
-    osp.splitext(osp.basename(v))[0] for v in mmcv.scandir(data_folder)
+    osp.splitext(osp.basename(v))[0] for v in scandir(data_folder)
     if v.endswith('_dataset.py')
 ]
 # import all the dataset modules

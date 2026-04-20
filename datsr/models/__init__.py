@@ -2,7 +2,7 @@ import importlib
 import logging
 import os.path as osp
 
-import mmcv
+from mmengine.utils import scandir
 
 
 # automatically scan and import model modules
@@ -10,7 +10,7 @@ import mmcv
 # '_model.py'
 model_folder = osp.dirname(osp.abspath(__file__))
 model_filenames = [
-    osp.splitext(osp.basename(v))[0] for v in mmcv.scandir(model_folder)
+    osp.splitext(osp.basename(v))[0] for v in scandir(model_folder)
     if v.endswith('_model.py')
 ]
 # import all the model modules

@@ -3,6 +3,7 @@ import os.path as osp
 
 import cv2
 import mmcv
+from mmengine.utils import scandir
 import numpy as np
 import torch
 import random
@@ -23,7 +24,7 @@ def read_img_seq(path):
     if isinstance(path, list):
         img_path_l = path
     else:
-        img_path_l = sorted([osp.join(path, v) for v in mmcv.scandir(path)])
+        img_path_l = sorted([osp.join(path, v) for v in scandir(path)])
     img_l = [mmcv.imread(v).astype(np.float32) / 255. for v in img_path_l]
     img_l = totensor(img_l)
     imgs = torch.stack(img_l, dim=0)
@@ -215,8 +216,8 @@ def paired_paths_from_folder(folders, keys, filename_tmpl):
     input_key = keys[0]
     ref_key = keys[1]
     
-    input_paths = list(mmcv.scandir(input_folder))
-    ref_paths = list(mmcv.scandir(ref_folder))
+    input_paths = list(scandir(input_folder))
+    ref_paths = list(scandir(ref_folder))
 
     assert len(input_paths) == len(ref_paths), (
         f'{input_key} and {ref_key} datasets have different number of images: '
@@ -256,8 +257,8 @@ def random_paths_from_folder(folders, keys, filename_tmpl):
     input_key = keys[0]
     ref_key = keys[1]
     
-    input_paths = list(mmcv.scandir(input_folder))
-    ref_paths = list(mmcv.scandir(ref_folder))
+    input_paths = list(scandir(input_folder))
+    ref_paths = list(scandir(ref_folder))
     ref_paths = [str(w) for w in random.sample(ref_paths, len(ref_paths))]
     assert len(input_paths) == len(ref_paths), (
         f'{input_key} and {ref_key} datasets have different number of images: '
