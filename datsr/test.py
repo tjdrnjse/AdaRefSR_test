@@ -2,12 +2,19 @@ import argparse
 import logging
 import os.path as osp
 
-from mmcv.runner import get_time_str, init_dist
+# [migrated from mmcv.runner] from mmcv.runner import get_time_str, init_dist
 
 from datsr.data import create_dataloader, create_dataset
 from datsr.models import create_model
 from datsr.utils import get_root_logger, make_exp_dirs
 from datsr.utils.options import dict2str, dict_to_nonedict, parse
+
+from mmengine.dist import init_dist
+
+def get_time_str() -> str:
+    import datetime
+    return datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
 
 
 def main():

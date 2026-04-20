@@ -32,7 +32,7 @@ from my_utils.training_utils import parse_args_paired_training
 from my_utils.dataset.ref_sr_dataset_train import ReferenceOnlineContrastDataset
 
 from torch.utils.tensorboard import SummaryWriter
-from mmcv.utils import get_logger
+# [migrated from mmcv.utils] from mmcv.utils import get_logger
 from ram.models.ram import ram
 from ram.models.ram_lora import ram as ram_deg
 from ram import inference_ram as inference
@@ -54,6 +54,33 @@ def register_unet_sr_model(unet_model, block_wise = False):
                 layer.attn_ref.processor = ReferenceAttnProcessorWithZeroConvolution()    
     return unet_model
 
+
+
+def get_logger(name: str, log_file=None, log_level: str = 'INFO', **kwargs):
+    """mmcv.utils.get_logger 호환 래퍼."""
+    import logging, os
+    logger = logging.getLogger(name)
+    if logger.hasHandlers():
+        return logger
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    logger.setLevel(level)
+    fmt = logging.Formatter(
+        '%(asctime)s.%(msecs)03d - %(levelname)s: %(message)s',
+        datefmt='%Y/%m/%d %H:%M:%S',
+    )
+    sh = logging.StreamHandler()
+    sh.setLevel(level)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    if log_file is not None:
+        _log_dir = os.path.dirname(os.path.abspath(log_file))
+        if _log_dir:
+            os.makedirs(_log_dir, exist_ok=True)
+        fh = logging.FileHandler(log_file, 'w')
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
 
 def main(args):
 
@@ -145,6 +172,8 @@ def main(args):
 
     if args.gan_disc_type == "vagan":
         import vision_aided_loss
+
+
         net_disc = vision_aided_loss.Discriminator(cv_type='dino', output_type='conv_multi_level', loss_type=args.gan_loss_type, device="cuda")
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")

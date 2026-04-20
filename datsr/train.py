@@ -6,7 +6,7 @@ import random
 import time
 
 import torch
-from mmcv.runner import get_time_str, init_dist
+# [migrated from mmcv.runner] from mmcv.runner import get_time_str, init_dist
 
 from mmsr.data import create_dataloader, create_dataset
 from mmsr.data.data_sampler import DistIterSampler
@@ -15,6 +15,13 @@ from mmsr.utils import (MessageLogger, get_root_logger, init_tb_logger,
                         make_exp_dirs, set_random_seed)
 from mmsr.utils.options import dict2str, dict_to_nonedict, parse
 from mmsr.utils.util import check_resume
+
+from mmengine.dist import init_dist
+
+def get_time_str() -> str:
+    import datetime
+    return datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
 
 
 def main():

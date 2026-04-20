@@ -3,11 +3,13 @@ import os
 
 import torch
 import torch.nn as nn
-from mmcv.runner import master_only
+# [migrated from mmcv.runner] from mmcv.runner import master_only
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 import datsr.models.lr_scheduler as lr_scheduler
 import pdb
+
+from mmengine.dist import master_only
 
 logger = logging.getLogger('base')
 

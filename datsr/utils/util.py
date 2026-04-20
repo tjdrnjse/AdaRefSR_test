@@ -12,8 +12,15 @@ import mmcv
 import numpy as np
 import torch
 import torch.nn.functional as F
-from mmcv.runner import get_time_str, master_only
+# [migrated from mmcv.runner] from mmcv.runner import get_time_str, master_only
 from torchvision.utils import make_grid
+from mmengine.dist import master_only
+from mmengine.utils import mkdir_or_exist
+
+def get_time_str() -> str:
+    import datetime
+    return datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
 
 logger = logging.getLogger('base')
 
@@ -56,7 +63,7 @@ def mkdir_and_rename(path):
         print(f'Path already exists. Rename it to {new_name}', flush=True)
         logger.info(f'Path already exists. Rename it to {new_name}')
         os.rename(path, new_name)
-    mmcv.mkdir_or_exist(path)
+    mkdir_or_exist(path)
 
 
 @master_only
@@ -70,7 +77,7 @@ def make_exp_dirs(opt):
     path_opt.pop('strict_load')
     for key, path in path_opt.items():
         if 'pretrain_model' not in key and 'resume' not in key:
-            mmcv.mkdir_or_exist(path)
+            mkdir_or_exist(path)
 
 
 def set_random_seed(seed):
@@ -200,6 +207,7 @@ def DUF_downsample(x, scale=4):
 
     def gkern(kernlen=13, nsig=1.6):
         import scipy.ndimage.filters as fi
+
         inp = np.zeros((kernlen, kernlen))
         # set element at the middle to one, a dirac delta
         inp[kernlen // 2, kernlen // 2] = 1

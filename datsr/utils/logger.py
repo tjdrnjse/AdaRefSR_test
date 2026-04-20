@@ -2,7 +2,9 @@ import datetime
 import logging
 import time
 
-from mmcv.runner import get_dist_info, master_only
+from mmengine.dist import get_dist_info, master_only
+
+# [migrated from mmcv.runner] from mmcv.runner import get_dist_info, master_only
 
 
 class MessageLogger():
@@ -77,6 +79,7 @@ class MessageLogger():
 @master_only
 def init_tb_logger(log_dir):
     from torch.utils.tensorboard import SummaryWriter
+
     tb_logger = SummaryWriter(log_dir=log_dir)
     return tb_logger
 
