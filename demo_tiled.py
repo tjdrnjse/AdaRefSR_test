@@ -129,50 +129,76 @@ def infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
 def _infer_single_image(lq_path, ref_path, output_path,
                         net_sr, net_ref, net_de, model_vlm, model_vlm_deg,
                         ref_writer, ref_reader, args, device, weight_dtype,
-                        tile_size, overlap, batch_sz):
-    """Process a single (lq, ref) image pair and save the result."""
+                        tile_size, overlap, batch_sz, scale):
+    """Process a single (lq, ref) image pair and save the result.
 
-    # ── Preprocess images ────────────────────────────────────────────────────
+    LQ is bicubic-upscaled by `scale` before tiling so the network output
+    covers `scale`× the original LQ resolution.  Ref is kept at its original
+    resolution and tiled proportionally (no pre-upscaling).
+    """
+
+    # ── Load & align original images ─────────────────────────────────────────
     lq_img  = Image.open(lq_path).convert("RGB")
     ref_img = Image.open(ref_path).convert("RGB")
 
-    # Align dimensions to multiples of 8 (VAE requirement)
-    lq_img  = lq_img.resize( (lq_img.size[0]  // 8 * 8,  lq_img.size[1]  // 8 * 8))
-    ref_img = ref_img.resize((ref_img.size[0] // 8 * 8, ref_img.size[1] // 8 * 8))
-    orig_w, orig_h = lq_img.size
+    # Original LQ size aligned to multiples of 8 (VAE requirement)
+    orig_w = lq_img.size[0] // 8 * 8
+    orig_h = lq_img.size[1] // 8 * 8
+    lq_img = lq_img.resize((orig_w, orig_h), Image.BICUBIC)
+
+    ref_img = ref_img.resize(
+        (ref_img.size[0] // 8 * 8, ref_img.size[1] // 8 * 8), Image.BICUBIC
+    )
 
     to_tensor = transforms.ToTensor()
-    x_lq  = to_tensor(lq_img)    # [3, H,  W ]
-    x_ref = to_tensor(ref_img)   # [3, Hr, Wr]
-    lq_h,  lq_w  = x_lq.shape[1],  x_lq.shape[2]
+    x_lq_orig = to_tensor(lq_img)   # [3, H,  W ] – original LQ (for RAM prompt)
+    x_ref      = to_tensor(ref_img)  # [3, Hr, Wr] – ref kept at original resolution
+
     ref_h, ref_w = x_ref.shape[1], x_ref.shape[2]
 
-    # ── Global semantic prompts (computed once from the full images) ──────────
-    # inference_ram() returns List[str] (one string per image in the batch).
-    # We extract [0] to get a plain str so that [prompt] * B stays List[str].
+    # ── Bicubic upscale LQ by `scale` (ref is NOT upscaled) ──────────────────
+    sr_h = orig_h * scale // 8 * 8   # align SR canvas to multiples of 8
+    sr_w = orig_w * scale // 8 * 8
+    x_lq = F.interpolate(
+        x_lq_orig.unsqueeze(0),
+        size=(sr_h, sr_w),
+        mode='bicubic', align_corners=False,
+    ).squeeze(0).clamp(0, 1)          # [3, H*scale, W*scale]
+
+    lq_h, lq_w = x_lq.shape[1], x_lq.shape[2]
+
+    # Bicubic LQ (PIL) used as wavelet color reference – must match SR output size
+    lq_bicubic_img = transforms.ToPILImage()(x_lq.cpu())
+
+    print(f"  LQ: {orig_w}x{orig_h}  ->  SR canvas: {lq_w}x{lq_h}  (x{scale})")
+
+    # ── Global semantic prompts (computed from original-resolution images) ────
+    # inference_ram() returns List[str]; extract [0] to keep prompt as plain str.
     with torch.no_grad():
         prompt_ref = inference(
-            ram_transforms(x_ref.unsqueeze(0)).to(device, dtype=torch.float16), model_vlm)[0]
+            ram_transforms(x_ref.unsqueeze(0)).to(device, dtype=torch.float16),
+            model_vlm)[0]
         prompt_src = inference(
-            ram_transforms(x_lq.unsqueeze(0)).to(device,  dtype=torch.float16), model_vlm_deg)[0]
+            ram_transforms(x_lq_orig.unsqueeze(0)).to(device, dtype=torch.float16),
+            model_vlm_deg)[0]
     print(f"  Prompt (ref): {prompt_ref}")
     print(f"  Prompt (src): {prompt_src}")
 
-    # ── Single-tile fast-path (image already fits in one tile) ───────────────
+    # ── Single-tile fast-path (upscaled LQ fits in one tile) ─────────────────
     if lq_h <= tile_size and lq_w <= tile_size:
-        print("  Image fits in one tile – running single inference.")
+        print("  SR canvas fits in one tile – running single inference.")
         x_src_t = x_lq.unsqueeze(0).to(device, dtype=weight_dtype)
         x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
         preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
                             x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
         pred_img = transforms.ToPILImage()((preds[0] * 0.5 + 0.5).clamp(0, 1).cpu())
         if args.get('align_method', 'wavelet') == 'wavelet':
-            pred_img = wavelet_color_fix(pred_img, lq_img)
-        pred_img.resize((orig_w, orig_h), Image.BICUBIC).save(output_path)
+            pred_img = wavelet_color_fix(pred_img, lq_bicubic_img)
+        pred_img.resize((orig_w * scale, orig_h * scale), Image.BICUBIC).save(output_path)
         print(f"  Saved: {output_path}")
         return
 
-    # ── Build tile grid ───────────────────────────────────────────────────────
+    # ── Build tile grid on the upscaled LQ canvas ────────────────────────────
     ys = tile_start_coords(lq_h, tile_size, overlap)
     xs = tile_start_coords(lq_w, tile_size, overlap)
     all_tiles = [(y, x) for y in ys for x in xs]
@@ -180,7 +206,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
     print(f"  Grid: {lq_h}x{lq_w} -> {len(ys)}x{len(xs)} = {n_tiles} tiles "
           f"(tile={tile_size}, overlap={overlap}, batch={batch_sz})")
 
-    # Output accumulators (float32 for precision)
+    # Output accumulators at the SR canvas size (float32 for precision)
     pred_acc   = torch.zeros(3, lq_h, lq_w, dtype=torch.float32, device=device)
     weight_acc = torch.zeros(1, lq_h, lq_w, dtype=torch.float32, device=device)
 
@@ -193,10 +219,13 @@ def _infer_single_image(lq_path, ref_path, output_path,
         lq_tiles  = []
         ref_tiles = []
         for (ty, tx) in batch_pos:
+            # LQ tile: cropped from the bicubic-upscaled LQ
             lq_tiles.append(x_lq[:, ty:ty + tile_size, tx:tx + tile_size])
 
-            ry  = int(ty * ref_h / lq_h)
-            rx  = int(tx * ref_w / lq_w)
+            # Ref tile: proportionally cropped from the ORIGINAL ref (no upscaling).
+            # rth/rtw is the ref crop size that corresponds to one LQ tile.
+            ry  = int(ty  * ref_h / lq_h)
+            rx  = int(tx  * ref_w / lq_w)
             rth = max(1, round(tile_size * ref_h / lq_h))
             rtw = max(1, round(tile_size * ref_w / lq_w))
             ry  = min(ry, max(0, ref_h - rth))
@@ -227,13 +256,13 @@ def _infer_single_image(lq_path, ref_path, output_path,
             pred_acc[:,   ty:ty + tile_size, tx:tx + tile_size] += pred * w
             weight_acc[:, ty:ty + tile_size, tx:tx + tile_size] += w
 
-    # ── Merge tiles ───────────────────────────────────────────────────────────
+    # ── Merge tiles & save ────────────────────────────────────────────────────
     result     = (pred_acc / weight_acc.clamp(min=1e-6)).clamp(0, 1)
     result_img = transforms.ToPILImage()(result.cpu())
     if args.get('align_method', 'wavelet') == 'wavelet':
-        result_img = wavelet_color_fix(result_img, lq_img)
-    result_img.resize((orig_w, orig_h), Image.BICUBIC).save(output_path)
-    print(f"  Saved: {output_path}")
+        result_img = wavelet_color_fix(result_img, lq_bicubic_img)
+    result_img.resize((orig_w * scale, orig_h * scale), Image.BICUBIC).save(output_path)
+    print(f"  Saved: {output_path}  ({orig_w * scale}x{orig_h * scale})")
 
 
 def run_demo_tiled(lq_path, ref_path, output_path, args):
@@ -252,6 +281,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
     tile_size = int(args.get("tile_size",       512))
     overlap   = int(args.get("tile_overlap",     64))
     batch_sz  = int(args.get("tile_batch_size",   4))
+    scale     = int(args.get("scale",             4))
 
     lq_is_dir  = os.path.isdir(lq_path)
     ref_is_dir = os.path.isdir(ref_path)
@@ -325,7 +355,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
             lq_f, ref_f, out_f,
             net_sr, net_ref, net_de, model_vlm, model_vlm_deg,
             ref_writer, ref_reader,
-            args, device, weight_dtype, tile_size, overlap, batch_sz,
+            args, device, weight_dtype, tile_size, overlap, batch_sz, scale,
         )
 
     print(f"\n>>> All done. {n_total} image(s) processed.")
@@ -350,6 +380,8 @@ if __name__ == "__main__":
                              help="Overlap between adjacent tiles in pixels.")
     demo_parser.add_argument("--tile_batch_size", type=int, default=None,
                              help="Number of tiles processed per GPU batch.")
+    demo_parser.add_argument("--scale",           type=int, default=None,
+                             help="SR upscale factor (default: from YAML or 4).")
 
     demo_args, unknown = demo_parser.parse_known_args()
 

@@ -34,3 +34,8 @@ tile_overlap: 64
 # tile_batch_size: number of tiles processed together on the GPU.
 #   - Increase if you have enough VRAM; decrease if you run out of memory.
 tile_batch_size: 4
+
+# scale: SR upscale factor.
+#   - Must match the training-time upscale ratio (default 4×).
+#   - LQ is bicubic-upscaled by this factor before tiling; output is scale× larger than input LQ.
+scale: 4
