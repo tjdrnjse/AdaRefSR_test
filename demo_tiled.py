@@ -148,11 +148,13 @@ def _infer_single_image(lq_path, ref_path, output_path,
     ref_h, ref_w = x_ref.shape[1], x_ref.shape[2]
 
     # ── Global semantic prompts (computed once from the full images) ──────────
+    # inference_ram() returns List[str] (one string per image in the batch).
+    # We extract [0] to get a plain str so that [prompt] * B stays List[str].
     with torch.no_grad():
         prompt_ref = inference(
-            ram_transforms(x_ref.unsqueeze(0)).to(device, dtype=torch.float16), model_vlm)
+            ram_transforms(x_ref.unsqueeze(0)).to(device, dtype=torch.float16), model_vlm)[0]
         prompt_src = inference(
-            ram_transforms(x_lq.unsqueeze(0)).to(device,  dtype=torch.float16), model_vlm_deg)
+            ram_transforms(x_lq.unsqueeze(0)).to(device,  dtype=torch.float16), model_vlm_deg)[0]
     print(f"  Prompt (ref): {prompt_ref}")
     print(f"  Prompt (src): {prompt_src}")
 
@@ -162,7 +164,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
         x_src_t = x_lq.unsqueeze(0).to(device, dtype=weight_dtype)
         x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
         preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
-                            x_src_t, x_ref_t, prompt_src, prompt_ref, weight_dtype)
+                            x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
         pred_img = transforms.ToPILImage()((preds[0] * 0.5 + 0.5).clamp(0, 1).cpu())
         if args.get('align_method', 'wavelet') == 'wavelet':
             pred_img = wavelet_color_fix(pred_img, lq_img)
