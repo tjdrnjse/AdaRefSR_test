@@ -77,6 +77,19 @@ def collect_image_files(folder):
     return files
 
 
+def find_roi_by_stem(roi_folder, stem):
+    """roi_folder 안에서 확장자 무관하게 stem 이 일치하는 첫 번째 이미지 경로를 반환.
+
+    예) stem='img001', roi_folder에 'img001.png' 존재 → 해당 경로 반환.
+        일치하는 파일이 없으면 None 반환.
+    """
+    for fname in os.listdir(roi_folder):
+        s, ext = os.path.splitext(fname)
+        if s == stem and ext.lower() in SUPPORTED_EXTENSIONS:
+            return os.path.join(roi_folder, fname)
+    return None
+
+
 # ── Main inference ───────────────────────────────────────────────────────────
 
 def load_models(args, device, weight_dtype):
@@ -371,12 +384,13 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
             if not os.path.exists(ref_file):
                 skipped.append(fname)
                 continue
-            # roi_path 가 폴더면 동일 파일명으로 매칭, 없으면 None (경고만)
+            # roi_path 가 폴더면 스템(확장자 제외 파일명)으로 매칭.
+            # lq 가 .jpeg 이고 roi 가 .png 여도 스템이 같으면 매칭됨.
             if roi_is_dir:
-                roi_file = os.path.join(roi_path, fname)
-                if not os.path.exists(roi_file):
+                stem     = os.path.splitext(fname)[0]
+                roi_file = find_roi_by_stem(roi_path, stem)
+                if roi_file is None:
                     roi_missing.append(fname)
-                    roi_file = None
             else:
                 roi_file = roi_path   # 파일 지정이거나 None
             image_pairs.append((
