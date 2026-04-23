@@ -11,6 +11,7 @@ from main_code.model.gen_model import GenModel
 from main_code.model.ref_model import RefModel
 from main_code.model.de_net import DEResNet
 from main_code.model.anymate_anyone.reference_attention import ReferenceNetAttention
+from visualize_aicg import AICGVisualizer
 
 from ram.models.ram import ram
 from ram.models.ram_lora import ram as ram_deg
@@ -129,7 +130,8 @@ def infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
 def _infer_single_image(lq_path, ref_path, output_path,
                         net_sr, net_ref, net_de, model_vlm, model_vlm_deg,
                         ref_writer, ref_reader, args, device, weight_dtype,
-                        tile_size, overlap, batch_sz, scale):
+                        tile_size, overlap, batch_sz, scale,
+                        visualize=False, roi_path=None, vis_output_path=None):
     """Process a single (lq, ref) image pair and save the result.
 
     LQ is bicubic-upscaled by `scale` before tiling so the network output
@@ -184,13 +186,38 @@ def _infer_single_image(lq_path, ref_path, output_path,
     print(f"  Prompt (ref): {prompt_ref}")
     print(f"  Prompt (src): {prompt_src}")
 
+    # ── ROI 마스크 로드 (시각화용, 옵션) ─────────────────────────────────────
+    roi_mask = None
+    if visualize and roi_path and os.path.exists(roi_path):
+        roi_pil  = Image.open(roi_path).convert("L")
+        roi_pil  = roi_pil.resize((lq_w, lq_h), Image.BILINEAR)
+        roi_mask = np.array(roi_pil).astype(np.float32) / 255.0  # [lq_h, lq_w]
+        print(f"  ROI mask loaded: {roi_path}")
+
     # ── Single-tile fast-path (upscaled LQ fits in one tile) ─────────────────
     if lq_h <= tile_size and lq_w <= tile_size:
         print("  SR canvas fits in one tile – running single inference.")
         x_src_t = x_lq.unsqueeze(0).to(device, dtype=weight_dtype)
         x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
-        preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
-                            x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
+
+        if visualize:
+            _vis_output = vis_output_path or output_path.replace(
+                os.path.splitext(output_path)[1], "_aicg_vis.png"
+            )
+            viz = AICGVisualizer(
+                net_sr.unet, roi_mask=roi_mask,
+                ref_h=ref_h, ref_w=ref_w,
+                tile_size=tile_size,
+                fusion_blocks=args.get("fusion_blocks", "full"),
+            )
+            with viz.capture_tile(0, 0, 0, 0, ref_h, ref_w, lq_h, lq_w):
+                preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
+                                    x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
+            viz.finalize(np.array(ref_img), _vis_output)
+        else:
+            preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
+                                x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
+
         pred_img = transforms.ToPILImage()((preds[0] * 0.5 + 0.5).clamp(0, 1).cpu())
         if args.get('align_method', 'wavelet') == 'wavelet':
             pred_img = wavelet_color_fix(pred_img, lq_bicubic_img)
@@ -210,6 +237,19 @@ def _infer_single_image(lq_path, ref_path, output_path,
     pred_acc   = torch.zeros(3, lq_h, lq_w, dtype=torch.float32, device=device)
     weight_acc = torch.zeros(1, lq_h, lq_w, dtype=torch.float32, device=device)
 
+    # ── 시각화 캔버스 초기화 ─────────────────────────────────────────────────
+    viz = None
+    if visualize:
+        _vis_output = vis_output_path or output_path.replace(
+            os.path.splitext(output_path)[1], "_aicg_vis.png"
+        )
+        viz = AICGVisualizer(
+            net_sr.unet, roi_mask=roi_mask,
+            ref_h=ref_h, ref_w=ref_w,
+            tile_size=tile_size,
+            fusion_blocks=args.get("fusion_blocks", "full"),
+        )
+
     # ── Tile inference loop ───────────────────────────────────────────────────
     for batch_start in range(0, n_tiles, batch_sz):
         batch_pos = all_tiles[batch_start : batch_start + batch_sz]
@@ -218,6 +258,8 @@ def _infer_single_image(lq_path, ref_path, output_path,
 
         lq_tiles  = []
         ref_tiles = []
+        tile_coords = []   # (ty, tx, ry, rx, rth, rtw) per tile in batch
+
         for (ty, tx) in batch_pos:
             # LQ tile: cropped from the bicubic-upscaled LQ
             lq_tiles.append(x_lq[:, ty:ty + tile_size, tx:tx + tile_size])
@@ -238,6 +280,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
                     mode='bicubic', align_corners=False,
                 ).squeeze(0)
             ref_tiles.append(ref_crop)
+            tile_coords.append((ty, tx, ry, rx, rth, rtw))
 
         x_src_b = torch.stack(lq_tiles).to(device, dtype=weight_dtype)
         x_ref_b = torch.stack(ref_tiles).to(device, dtype=weight_dtype)
@@ -245,10 +288,28 @@ def _infer_single_image(lq_path, ref_path, output_path,
         prompts_ref_b = [prompt_ref] * B
         prompts_src_b = [prompt_src] * B
 
-        predictions = infer_batch(
-            net_sr, net_ref, net_de, ref_writer, ref_reader,
-            x_src_b, x_ref_b, prompts_src_b, prompts_ref_b, weight_dtype,
-        )
+        # 시각화: 타일 1개씩 capture_tile 컨텍스트로 감쌈
+        # (배치 내 타일별로 독립적인 Ref 좌표가 필요하므로 1개씩 처리)
+        if viz is not None:
+            predictions_list = []
+            for i, (ty, tx, ry, rx, rth, rtw) in enumerate(tile_coords):
+                x_src_1 = x_src_b[i:i+1]
+                x_ref_1 = x_ref_b[i:i+1]
+                with viz.capture_tile(ty, tx, ry, rx, rth, rtw, lq_h, lq_w):
+                    preds_1 = infer_batch(
+                        net_sr, net_ref, net_de, ref_writer, ref_reader,
+                        x_src_1, x_ref_1,
+                        [prompts_src_b[i]], [prompts_ref_b[i]],
+                        weight_dtype,
+                    )
+                predictions_list.append(preds_1)
+            # 배치 차원으로 재결합 (SR 누적에 사용)
+            predictions = torch.cat(predictions_list, dim=0)
+        else:
+            predictions = infer_batch(
+                net_sr, net_ref, net_de, ref_writer, ref_reader,
+                x_src_b, x_ref_b, prompts_src_b, prompts_ref_b, weight_dtype,
+            )
 
         for k, (ty, tx) in enumerate(batch_pos):
             w    = tile_weight_map(tile_size, overlap, ty, tx, lq_h, lq_w).to(device)
@@ -264,6 +325,10 @@ def _infer_single_image(lq_path, ref_path, output_path,
     result_img.resize((orig_w * scale, orig_h * scale), Image.BICUBIC).save(output_path)
     print(f"  Saved: {output_path}  ({orig_w * scale}x{orig_h * scale})")
 
+    # ── AICG 시각화 저장 ─────────────────────────────────────────────────────
+    if viz is not None:
+        viz.finalize(np.array(ref_img), _vis_output)
+
 
 def run_demo_tiled(lq_path, ref_path, output_path, args):
     """
@@ -278,10 +343,13 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
     device       = accelerator.device
     weight_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.float32
 
-    tile_size = int(args.get("tile_size",       512))
-    overlap   = int(args.get("tile_overlap",     64))
-    batch_sz  = int(args.get("tile_batch_size",   4))
-    scale     = int(args.get("scale",             4))
+    tile_size  = int(args.get("tile_size",       512))
+    overlap    = int(args.get("tile_overlap",     64))
+    batch_sz   = int(args.get("tile_batch_size",   4))
+    scale      = int(args.get("scale",             4))
+    visualize  = bool(args.get("visualize",      False))
+    roi_path   = args.get("roi_path",            None)
+    vis_out    = args.get("vis_output_path",     None)
 
     lq_is_dir  = os.path.isdir(lq_path)
     ref_is_dir = os.path.isdir(ref_path)
@@ -356,6 +424,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
             net_sr, net_ref, net_de, model_vlm, model_vlm_deg,
             ref_writer, ref_reader,
             args, device, weight_dtype, tile_size, overlap, batch_sz, scale,
+            visualize=visualize, roi_path=roi_path, vis_output_path=vis_out,
         )
 
     print(f"\n>>> All done. {n_total} image(s) processed.")
@@ -380,8 +449,14 @@ if __name__ == "__main__":
                              help="Overlap between adjacent tiles in pixels.")
     demo_parser.add_argument("--tile_batch_size", type=int, default=None,
                              help="Number of tiles processed per GPU batch.")
-    demo_parser.add_argument("--scale",           type=int, default=None,
+    demo_parser.add_argument("--scale",           type=int,  default=None,
                              help="SR upscale factor (default: from YAML or 4).")
+    demo_parser.add_argument("--visualize",       action="store_true", default=False,
+                             help="AICG Trust/Verify/Combined 히트맵 시각화 활성화.")
+    demo_parser.add_argument("--roi_path",        type=str,  default=None,
+                             help="ROI 마스크 이미지 경로 (grayscale PNG, LQ 해상도).")
+    demo_parser.add_argument("--vis_output_path", type=str,  default=None,
+                             help="시각화 PNG 저장 경로 (미지정 시 output_path 옆에 자동 생성).")
 
     demo_args, unknown = demo_parser.parse_known_args()
 

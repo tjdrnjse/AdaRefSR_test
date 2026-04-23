@@ -39,3 +39,92 @@ tile_batch_size: 4
 #   - Must match the training-time upscale ratio (default 4×).
 #   - LQ is bicubic-upscaled by this factor before tiling; output is scale× larger than input LQ.
 scale: 4
+
+# ── AICG 시각화 설정 (visualize_aicg.py) ────────────────────────────────────
+# visualize: true 로 설정하면 인퍼런스와 동시에 3종 히트맵을 생성.
+#   - Map1 Trust    : ROI 영역 픽셀이 Ref 이미지의 어느 위치를 참조했는지 (Eq.2 A_RA)
+#   - Map2 Verify   : AICG Gate(G) 값을 Ref 공간으로 역투영 (Eq.6 G)
+#   - Map3 Combined : 최종 복원에 기여한 Ref 위치 ((ROI×G) → Ref 공간, Eq.7)
+#   출력: [Trust | Verify | Combined] 3패널을 가로 연결한 고해상도 PNG
+visualize: false
+
+# roi_path: 사용자가 지정할 LQ 관심 영역(ROI) 마스크 이미지 경로.
+#   - 포맷: grayscale PNG, 픽셀값 0(무관심)~255(관심)
+#   - 해상도: 원본 LQ 이미지와 동일하거나 비슷하면 자동 리사이즈.
+#   - null 로 두면 LQ 전체 영역을 ROI로 간주 (Map1=Map3 ≈ Map2).
+roi_path: null   # 예) "./assets/roi/img_mask.png"
+
+# vis_output_path: 시각화 PNG 저장 경로.
+#   - null 로 두면 output_path 와 동일 디렉터리에 "<파일명>_aicg_vis.png" 로 자동 저장.
+vis_output_path: null   # 예) "./assets/results/img_aicg_vis.png"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 사용 예시 (CLI)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# [예시 1] 단일 이미지 SR + 시각화 (ROI 없음 – 전체 영역)
+#
+#   python demo_tiled.py \
+#     --lq_path     ./assets/lq/sample.png \
+#     --ref_path    ./assets/ref/sample.png \
+#     --output_path ./assets/results/sample.png \
+#     --visualize
+#
+#   → SR 결과: ./assets/results/sample.png
+#   → 히트맵:  ./assets/results/sample_aicg_vis.png  (Trust | Verify | Combined)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# [예시 2] 단일 이미지 SR + 시각화 (사용자 ROI 마스크 지정)
+#
+#   python demo_tiled.py \
+#     --lq_path        ./assets/lq/sample.png \
+#     --ref_path       ./assets/ref/sample.png \
+#     --output_path    ./assets/results/sample.png \
+#     --visualize \
+#     --roi_path       ./assets/roi/sample_mask.png \
+#     --vis_output_path ./assets/results/sample_vis.png
+#
+#   → ROI 마스크(grayscale PNG)가 지정된 영역만 Trust/Combined 맵에 반영됨.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# [예시 3] 폴더 배치 처리 + 시각화
+#
+#   python demo_tiled.py \
+#     --lq_path     ./assets/lq/ \
+#     --ref_path    ./assets/ref/ \
+#     --output_path ./assets/results/ \
+#     --visualize
+#
+#   → lq/ 와 ref/ 안의 동일 파일명 이미지를 전부 처리.
+#   → 각 이미지에 대해 results/<파일명>_aicg_vis.png 생성.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# [예시 4] YAML에서 시각화 기본값 활성화 (이 파일 수정)
+#
+#   visualize:        true
+#   roi_path:         null          # 또는 "./assets/roi/mask.png"
+#   vis_output_path:  null          # 자동 경로
+#
+#   python demo_tiled.py --config ./configs/demo_tiled_config.yaml \
+#     --lq_path ./assets/lq/ --ref_path ./assets/ref/ --output_path ./out/
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# [히트맵 해석 가이드]
+#
+#   Map1 Trust    – 밝은 영역: LQ ROI 가 Ref 이미지의 해당 위치를 강하게 참조함.
+#                  어두운 영역: 참조가 거의 없어 SR에 Ref 기여 없음.
+#
+#   Map2 Verify   – 밝은 영역: AICG Gate가 열려 있어 Ref 정보가 신뢰됨.
+#                  어두운 영역: Gate가 닫혀 있어 Ref 정보가 억제됨 (불일치 감지).
+#
+#   Map3 Combined – Map1 × Map2. 실제 복원에 기여한 Ref의 유효 위치.
+#                  Trust 하고 Verify 된 교집합 영역.
+#
+#   세 맵이 모두 어두우면 → SR이 Ref 없이 내재적 prior 만으로 복원됨.
+#   Map1은 밝은데 Map2가 어두우면 → LQ가 Ref를 참조했지만 AICG가 억제함
+#                                     (Ref 품질 불량 / 의미론적 불일치).
+# ─────────────────────────────────────────────────────────────────────────────
