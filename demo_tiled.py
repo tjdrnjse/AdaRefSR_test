@@ -354,6 +354,8 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
     lq_is_dir  = os.path.isdir(lq_path)
     ref_is_dir = os.path.isdir(ref_path)
 
+    roi_is_dir = os.path.isdir(roi_path) if roi_path else False
+
     # ── 처리 대상 쌍 목록 구성 ────────────────────────────────────────────────
     if lq_is_dir and ref_is_dir:
         # 폴더 모드: 동일 파일명으로 매칭
@@ -363,19 +365,32 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
 
         image_pairs = []
         skipped = []
+        roi_missing = []
         for fname in lq_files:
             ref_file = os.path.join(ref_path, fname)
             if not os.path.exists(ref_file):
                 skipped.append(fname)
                 continue
+            # roi_path 가 폴더면 동일 파일명으로 매칭, 없으면 None (경고만)
+            if roi_is_dir:
+                roi_file = os.path.join(roi_path, fname)
+                if not os.path.exists(roi_file):
+                    roi_missing.append(fname)
+                    roi_file = None
+            else:
+                roi_file = roi_path   # 파일 지정이거나 None
             image_pairs.append((
                 os.path.join(lq_path, fname),
                 ref_file,
                 os.path.join(output_path, fname),
+                roi_file,
             ))
 
         if skipped:
             print(f"[WARNING] {len(skipped)} file(s) skipped (no matching ref): {skipped}")
+        if roi_missing:
+            print(f"[WARNING] {len(roi_missing)} file(s) have no matching ROI mask "
+                  f"(will use full-image ROI): {roi_missing}")
         if not image_pairs:
             raise FileNotFoundError(
                 "No matching (lq, ref) pairs found. "
@@ -386,6 +401,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
         print(f">>> Folder mode: {len(image_pairs)} image pair(s) found.")
         print(f"    lq_path    : {lq_path}")
         print(f"    ref_path   : {ref_path}")
+        print(f"    roi_path   : {roi_path or '(none)'}")
         print(f"    output_path: {output_path}")
 
     elif not lq_is_dir and not ref_is_dir:
@@ -400,7 +416,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
                 os.makedirs(out_dir, exist_ok=True)
             out_file = output_path
 
-        image_pairs = [(lq_path, ref_path, out_file)]
+        image_pairs = [(lq_path, ref_path, out_file, roi_path)]
         print(f">>> Single-image mode: {os.path.basename(lq_path)}")
 
     else:
@@ -417,14 +433,14 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
 
     # ── 이미지 쌍 순차 처리 ──────────────────────────────────────────────────
     n_total = len(image_pairs)
-    for idx, (lq_f, ref_f, out_f) in enumerate(image_pairs, 1):
+    for idx, (lq_f, ref_f, out_f, roi_f) in enumerate(image_pairs, 1):
         print(f"\n[{idx}/{n_total}] {os.path.basename(lq_f)}")
         _infer_single_image(
             lq_f, ref_f, out_f,
             net_sr, net_ref, net_de, model_vlm, model_vlm_deg,
             ref_writer, ref_reader,
             args, device, weight_dtype, tile_size, overlap, batch_sz, scale,
-            visualize=visualize, roi_path=roi_path, vis_output_path=vis_out,
+            visualize=visualize, roi_path=roi_f, vis_output_path=vis_out,
         )
 
     print(f"\n>>> All done. {n_total} image(s) processed.")

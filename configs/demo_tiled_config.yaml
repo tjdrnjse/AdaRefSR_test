@@ -48,11 +48,13 @@ scale: 4
 #   출력: [Trust | Verify | Combined] 3패널을 가로 연결한 고해상도 PNG
 visualize: false
 
-# roi_path: 사용자가 지정할 LQ 관심 영역(ROI) 마스크 이미지 경로.
-#   - 포맷: grayscale PNG, 픽셀값 0(무관심)~255(관심)
-#   - 해상도: 원본 LQ 이미지와 동일하거나 비슷하면 자동 리사이즈.
-#   - null 로 두면 LQ 전체 영역을 ROI로 간주 (Map1=Map3 ≈ Map2).
-roi_path: null   # 예) "./assets/roi/img_mask.png"
+# roi_path: LQ 관심 영역(ROI) 마스크 경로.
+#   - 단일 파일: grayscale PNG 1장을 모든 이미지에 공통 적용.
+#   - 폴더 지정: lq_path/ref_path 와 동일한 파일명으로 이미지별 매칭.
+#               매칭 파일이 없는 경우 해당 이미지는 전체 영역을 ROI로 사용 (경고 출력).
+#   - 픽셀값: 0(무관심) ~ 255(관심), LQ 해상도와 다르면 자동 리사이즈.
+#   - null 로 두면 전체 영역을 ROI로 간주.
+roi_path: null   # 예) "./assets/roi/img_mask.png"  또는  "./assets/roi/"
 
 # vis_output_path: 시각화 PNG 저장 경로.
 #   - null 로 두면 output_path 와 동일 디렉터리에 "<파일명>_aicg_vis.png" 로 자동 저장.
@@ -89,16 +91,31 @@ vis_output_path: null   # 예) "./assets/results/img_aicg_vis.png"
 #
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# [예시 3] 폴더 배치 처리 + 시각화
+# [예시 3] 폴더 배치 처리 + 시각화 (ROI도 폴더로 지정)
 #
 #   python demo_tiled.py \
 #     --lq_path     ./assets/lq/ \
 #     --ref_path    ./assets/ref/ \
 #     --output_path ./assets/results/ \
-#     --visualize
+#     --visualize \
+#     --roi_path    ./assets/roi/
 #
-#   → lq/ 와 ref/ 안의 동일 파일명 이미지를 전부 처리.
+#   → lq/, ref/, roi/ 안의 동일 파일명 이미지를 자동 매칭하여 전부 처리.
+#   → roi/ 에 해당 파일이 없는 이미지는 전체 영역을 ROI로 사용 (경고 출력).
 #   → 각 이미지에 대해 results/<파일명>_aicg_vis.png 생성.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# [예시 3-b] 폴더 배치 처리 + ROI 단일 파일 공통 적용
+#
+#   python demo_tiled.py \
+#     --lq_path     ./assets/lq/ \
+#     --ref_path    ./assets/ref/ \
+#     --output_path ./assets/results/ \
+#     --visualize \
+#     --roi_path    ./assets/roi/common_mask.png
+#
+#   → ROI 마스크 1장을 모든 이미지에 동일하게 적용.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 #
