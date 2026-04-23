@@ -66,6 +66,25 @@ def tile_start_coords(total, tile_size, overlap):
     return coords
 
 
+# ── Visualization path helper ────────────────────────────────────────────────
+
+def _resolve_vis_path(vis_output_path: str | None, sr_output_path: str) -> str:
+    """[Fix 1] vis_output_path 가 폴더이거나 None 일 때 파일 경로를 확정.
+
+    - None        → sr_output_path 와 같은 디렉터리에 <stem>_aicg_vis.png
+    - 폴더 경로   → 그 폴더 안에 <stem>_aicg_vis.png
+    - 파일 경로   → 그대로 사용
+    """
+    stem = os.path.splitext(os.path.basename(sr_output_path))[0]
+    fname = stem + "_aicg_vis.png"
+
+    if not vis_output_path:
+        return os.path.join(os.path.dirname(os.path.abspath(sr_output_path)), fname)
+    if os.path.isdir(vis_output_path):
+        return os.path.join(vis_output_path, fname)
+    return vis_output_path
+
+
 # ── Image collection ─────────────────────────────────────────────────────────
 
 def collect_image_files(folder):
@@ -214,9 +233,8 @@ def _infer_single_image(lq_path, ref_path, output_path,
         x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
 
         if visualize:
-            _vis_output = vis_output_path or output_path.replace(
-                os.path.splitext(output_path)[1], "_aicg_vis.png"
-            )
+            # [Fix 1] 폴더 경로·None 모두 파일 경로로 변환
+            _vis_output = _resolve_vis_path(vis_output_path, output_path)
             viz = AICGVisualizer(
                 net_sr.unet, roi_mask=roi_mask,
                 ref_h=ref_h, ref_w=ref_w,
@@ -253,9 +271,8 @@ def _infer_single_image(lq_path, ref_path, output_path,
     # ── 시각화 캔버스 초기화 ─────────────────────────────────────────────────
     viz = None
     if visualize:
-        _vis_output = vis_output_path or output_path.replace(
-            os.path.splitext(output_path)[1], "_aicg_vis.png"
-        )
+        # [Fix 1] 폴더 경로·None 모두 파일 경로로 변환
+        _vis_output = _resolve_vis_path(vis_output_path, output_path)
         viz = AICGVisualizer(
             net_sr.unet, roi_mask=roi_mask,
             ref_h=ref_h, ref_w=ref_w,
@@ -481,7 +498,8 @@ if __name__ == "__main__":
                              help="Number of tiles processed per GPU batch.")
     demo_parser.add_argument("--scale",           type=int,  default=None,
                              help="SR upscale factor (default: from YAML or 4).")
-    demo_parser.add_argument("--visualize",       action="store_true", default=False,
+    # [Fix 3] default=None: CLI 미지정 시 None → cli_overrides 에서 제외 → YAML 값 유지
+    demo_parser.add_argument("--visualize",       action="store_true", default=None,
                              help="AICG Trust/Verify/Combined 히트맵 시각화 활성화.")
     demo_parser.add_argument("--roi_path",        type=str,  default=None,
                              help="ROI 마스크 이미지 경로 (grayscale PNG, LQ 해상도).")
