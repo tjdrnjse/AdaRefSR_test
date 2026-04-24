@@ -97,24 +97,33 @@ class _LayerAccumulator:
         self.n:  int = 0
 
     @staticmethod
-    def _resize1d(v: torch.Tensor, target: int) -> torch.Tensor:
-        if v.shape[0] == target:
+    def _resize2d(v: torch.Tensor, target_L: int) -> torch.Tensor:
+        """[L] → 2D bilinear resize → [target_L].
+
+        1D linear interpolation crosses row boundaries of the flattened
+        spatial map, creating horizontal smearing artifacts.  Reshape to
+        (ls, ls) first so the bilinear kernel stays within each spatial
+        neighbourhood.
+        """
+        if v.shape[0] == target_L:
             return v
+        src_ls = int(math.sqrt(v.shape[0]))
+        tgt_ls = int(math.sqrt(target_L))
         return F.interpolate(
-            v.float().view(1, 1, -1),   # 디바이스 유지 (.cpu() 없음)
-            size=target,
-            mode='linear',
+            v.float().reshape(1, 1, src_ls, src_ls),
+            size=(tgt_ls, tgt_ls),
+            mode='bilinear',
             align_corners=False,
-        ).squeeze(0).squeeze(0)
+        ).reshape(-1)
 
     def update(self, m1: torch.Tensor, m2: torch.Tensor, m3: torch.Tensor):
         if self.m1 is None:
             self.m1, self.m2, self.m3 = m1.clone(), m2.clone(), m3.clone()
         else:
             t = self.m1.shape[0]
-            self.m1 += self._resize1d(m1, t)
-            self.m2 += self._resize1d(m2, t)
-            self.m3 += self._resize1d(m3, t)
+            self.m1 += self._resize2d(m1, t)
+            self.m2 += self._resize2d(m2, t)
+            self.m3 += self._resize2d(m3, t)
         self.n += 1
 
     def mean(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -237,13 +246,16 @@ class AICGVisualizer:
                         # G 재현 (Eq.3~6)
                         ts_tok = ar.learnable_token.expand(B_val, -1, -1)
                         ts_k   = ar.head_to_batch_dim(ts_tok)
+                        # Eq.4: softmax over L_ref to get per-token weights, then ksum
                         s_ref  = torch.softmax(
                             torch.bmm(ts_k, k.transpose(-1, -2)) * ar.scale, dim=-1)
                         ksum   = torch.bmm(s_ref, k)
-                        smap   = torch.softmax(
-                            torch.bmm(q, ksum.transpose(-1, -2)) * ar.scale, dim=-1)
-                        gate   = torch.sigmoid(
-                            ar.batch_to_head_dim(smap).mean(dim=-1))  # [B, L_q]
+                        # Eq.5-6: raw attention scores (no softmax) → batch_to_head_dim
+                        # → mean → sigmoid.  Matches attn_processor.py lines 65-67
+                        # exactly (processor does NOT softmax attn_summary).
+                        smap_raw = torch.bmm(q, ksum.transpose(-1, -2)) * ar.scale
+                        gate     = torch.sigmoid(
+                            ar.batch_to_head_dim(smap_raw).mean(dim=-1))  # [B, L_q]
 
                         actual_heads = q.shape[0] // B_val
                         L_q_actual   = q.shape[1]
