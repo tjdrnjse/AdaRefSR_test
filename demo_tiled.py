@@ -3,7 +3,7 @@ import os
 import argparse
 import sys
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 import torch.nn.functional as F
 
@@ -172,8 +172,10 @@ def _infer_single_image(lq_path, ref_path, output_path,
     """
 
     # ── Load & align original images ─────────────────────────────────────────
-    lq_img  = Image.open(lq_path).convert("RGB")
-    ref_img = Image.open(ref_path).convert("RGB")
+    # exif_transpose: JPEG EXIF 회전 태그를 픽셀에 실제 적용.
+    # PIL은 기본적으로 EXIF를 무시해 Windows 뷰어와 방향이 달라질 수 있음.
+    lq_img  = ImageOps.exif_transpose(Image.open(lq_path).convert("RGB"))
+    ref_img = ImageOps.exif_transpose(Image.open(ref_path).convert("RGB"))
 
     # Original LQ size aligned to multiples of 8 (VAE requirement)
     orig_w = lq_img.size[0] // 8 * 8
@@ -221,7 +223,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
     # ── ROI 마스크 로드 (시각화용, 옵션) ─────────────────────────────────────
     roi_mask = None
     if visualize and roi_path and os.path.exists(roi_path):
-        roi_pil  = Image.open(roi_path).convert("L")
+        roi_pil  = ImageOps.exif_transpose(Image.open(roi_path).convert("L"))
         roi_pil  = roi_pil.resize((lq_w, lq_h), Image.BILINEAR)
         roi_mask = np.array(roi_pil).astype(np.float32) / 255.0  # [lq_h, lq_w]
         print(f"  ROI mask loaded: {roi_path}")
