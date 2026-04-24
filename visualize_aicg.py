@@ -312,6 +312,8 @@ class AICGVisualizer:
         def to_2d(vec: torch.Tensor) -> torch.Tensor:
             ls = int(math.sqrt(vec.shape[0]))   # L_ref에서 역산
             v  = vec.cpu().float().reshape(1, 1, ls, ls)
+            mn, mx = v.min(), v.max()
+            v  = (v - mn) / (mx - mn + 1e-8)
             return F.interpolate(
                 v, size=(rth, rtw), mode='bilinear', align_corners=False
             ).squeeze()   # [rth, rtw]
