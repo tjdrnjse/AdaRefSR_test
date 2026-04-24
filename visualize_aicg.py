@@ -46,16 +46,9 @@ def compute_aicg_maps(
     A_RA(Eq.2)를 헤드별 계산 후 즉시 [L_ref]로 투영·삭제.
     query.shape[0] 에서 헤드 수를 자동 도출.
 
-    Map1 Trust    : roi @ A_RA_avg          → [L_ref]
-    Map2 Verify   : G 직접 사용             → [L_q] (= L_ref, 희석 없음)
-    Map3 Combined : (roi * G) @ A_RA_avg    → [L_ref]
-
-    Map2 설계 노트:
-      `G @ A_RA`로 Ref 공간에 투영하면 Softmax가 행 합계 = 1이므로
-      gate 값이 L_ref개 위치에 희석되어 평균값이 ≈ sum(G)/L_ref 로 낮아짐.
-      G를 직접 반환하면 sigmoid 출력 범위 [0,1]의 full contrast를 보존.
-      LQ·Ref 타일이 동일 tile_size 처리 → L_q = L_ref이므로 shape 호환.
-
+    Shape 흐름:
+      a_ra_h : [L_q, L_ref]   (헤드 h, 즉시 해제)
+      acc*   : [L_ref]        (헤드 평균 누적)
     Returns: (map1, map2, map3)  각각 [L_ref], query.device
     """
     device     = query.device
@@ -67,6 +60,7 @@ def compute_aicg_maps(
     roi_g = roi * g
 
     acc1 = torch.zeros(L_ref, dtype=torch.float32, device=device)
+    acc2 = torch.zeros(L_ref, dtype=torch.float32, device=device)
     acc3 = torch.zeros(L_ref, dtype=torch.float32, device=device)
 
     q32 = query.float()
@@ -75,11 +69,11 @@ def compute_aicg_maps(
     for h_idx in range(num_heads):
         a_ra_h = torch.softmax(q32[h_idx] @ k32[h_idx].T * scale, dim=-1)
         acc1 += roi   @ a_ra_h
+        acc2 += g     @ a_ra_h
         acc3 += roi_g @ a_ra_h
         del a_ra_h
 
-    # Map2: gate 값 직접 (A_RA 투영 없음) — L_q = L_ref 보장
-    return acc1 / num_heads, g.clone(), acc3 / num_heads
+    return acc1 / num_heads, acc2 / num_heads, acc3 / num_heads
 
 
 # ============================================================================
@@ -318,8 +312,8 @@ class AICGVisualizer:
         def to_2d(vec: torch.Tensor) -> torch.Tensor:
             ls = int(math.sqrt(vec.shape[0]))   # L_ref에서 역산
             v  = vec.cpu().float().reshape(1, 1, ls, ls)
-            # 타일별 정규화 제거 → 전역 강도 정보를 canvas에 보존.
-            # finalize()의 blend()에서 전역 min-max 정규화를 한 번만 수행.
+            mn, mx = v.min(), v.max()
+            v  = (v - mn) / (mx - mn + 1e-8)
             return F.interpolate(
                 v, size=(rth, rtw), mode='bilinear', align_corners=False
             ).squeeze()   # [rth, rtw]
