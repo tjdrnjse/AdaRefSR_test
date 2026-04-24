@@ -119,11 +119,11 @@ class _LayerAccumulator:
 
     @staticmethod
     def _resize1d(v: torch.Tensor, target: int) -> torch.Tensor:
-        """[L] → [target] 1-D linear interpolation."""
+        """[L] → [target] 1-D linear interpolation. 입력 디바이스를 유지."""
         if v.shape[0] == target:
             return v
         return F.interpolate(
-            v.cpu().float().view(1, 1, -1),
+            v.float().view(1, 1, -1),   # .cpu() 제거 – CUDA 텐서 그대로 처리
             size=target,
             mode='linear',
             align_corners=False,
