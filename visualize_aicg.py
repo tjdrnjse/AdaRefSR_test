@@ -55,7 +55,19 @@ def compute_aicg_maps(
     num_heads  = query.shape[0]          # 레이어별 실제 헤드 수 자동 도출
     L_ref      = key.shape[1]
 
+    L_q   = query.shape[1]
     roi   = roi_vec.float().to(device)
+    if roi.shape[0] != L_q:
+        # roi 길이가 L_q와 다를 때 2D bilinear 보정
+        ls_src = int(math.sqrt(roi.shape[0]))
+        ls_dst = int(math.sqrt(L_q))
+        roi = F.interpolate(
+            roi.reshape(1, 1, ls_src, ls_src),
+            size=(ls_dst, ls_dst),
+            mode='bilinear',
+            align_corners=False,
+        ).reshape(-1).to(device)
+
     g     = gate[0].float().to(device)  # [L_q]
     roi_g = roi * g
 
@@ -250,12 +262,12 @@ class AICGVisualizer:
                         s_ref  = torch.softmax(
                             torch.bmm(ts_k, k.transpose(-1, -2)) * ar.scale, dim=-1)
                         ksum   = torch.bmm(s_ref, k)
-                        # Eq.5-6: raw attention scores (no softmax) → batch_to_head_dim
-                        # → mean → sigmoid.  Matches attn_processor.py lines 65-67
-                        # exactly (processor does NOT softmax attn_summary).
-                        smap_raw = torch.bmm(q, ksum.transpose(-1, -2)) * ar.scale
-                        gate     = torch.sigmoid(
-                            ar.batch_to_head_dim(smap_raw).mean(dim=-1))  # [B, L_q]
+                        # Eq.5: Smap = softmax(Q·Ksum^T / √d, dim=-1)  [B*h, L_q, M]
+                        # Eq.6: G = σ( mean_{M, heads}(Smap) )          [B, L_q]
+                        smap = torch.softmax(
+                            torch.bmm(q, ksum.transpose(-1, -2)) * ar.scale, dim=-1)
+                        gate = torch.sigmoid(
+                            ar.batch_to_head_dim(smap).mean(dim=-1))  # [B, L_q]
 
                         actual_heads = q.shape[0] // B_val
                         L_q_actual   = q.shape[1]
@@ -310,8 +322,12 @@ class AICGVisualizer:
         m1, m2, m3 = acc.mean()   # 각각 [L_ref]
 
         def to_2d(vec: torch.Tensor) -> torch.Tensor:
-            ls = int(math.sqrt(vec.shape[0]))   # L_ref에서 역산
-            v  = vec.cpu().float().reshape(1, 1, ls, ls)
+            l  = vec.shape[0]
+            ls = int(math.sqrt(l))
+            if ls * ls != l:          # 비정사각 L_ref → tile_size//8 fallback
+                ls = self.tile_size // 8
+                l  = ls * ls
+            v  = vec.cpu().float()[:l].reshape(1, 1, ls, ls)
             mn, mx = v.min(), v.max()
             v  = (v - mn) / (mx - mn + 1e-8)
             return F.interpolate(
