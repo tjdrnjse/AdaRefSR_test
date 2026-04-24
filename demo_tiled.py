@@ -318,23 +318,12 @@ def _infer_single_image(lq_path, ref_path, output_path,
         prompts_ref_b = [prompt_ref] * B
         prompts_src_b = [prompt_src] * B
 
-        # 시각화: 타일 1개씩 capture_tile 컨텍스트로 감쌈
-        # (배치 내 타일별로 독립적인 Ref 좌표가 필요하므로 1개씩 처리)
         if viz is not None:
-            predictions_list = []
-            for i, (ty, tx, ry, rx, rth, rtw) in enumerate(tile_coords):
-                x_src_1 = x_src_b[i:i+1]
-                x_ref_1 = x_ref_b[i:i+1]
-                with viz.capture_tile(ty, tx, ry, rx, rth, rtw, lq_h, lq_w):
-                    preds_1 = infer_batch(
-                        net_sr, net_ref, net_de, ref_writer, ref_reader,
-                        x_src_1, x_ref_1,
-                        [prompts_src_b[i]], [prompts_ref_b[i]],
-                        weight_dtype,
-                    )
-                predictions_list.append(preds_1)
-            # 배치 차원으로 재결합 (SR 누적에 사용)
-            predictions = torch.cat(predictions_list, dim=0)
+            with viz.capture_batch(tile_coords, lq_h, lq_w):
+                predictions = infer_batch(
+                    net_sr, net_ref, net_de, ref_writer, ref_reader,
+                    x_src_b, x_ref_b, prompts_src_b, prompts_ref_b, weight_dtype,
+                )
         else:
             predictions = infer_batch(
                 net_sr, net_ref, net_de, ref_writer, ref_reader,
