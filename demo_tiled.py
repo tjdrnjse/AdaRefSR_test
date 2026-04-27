@@ -240,13 +240,14 @@ def _infer_single_image(lq_path, ref_path, output_path,
             viz = AICGVisualizer(
                 net_sr.unet, roi_mask=roi_mask,
                 ref_h=ref_h, ref_w=ref_w,
+                lq_h=lq_h, lq_w=lq_w,
                 tile_size=tile_size,
                 fusion_blocks=args.get("fusion_blocks", "full"),
             )
             with viz.capture_tile(0, 0, 0, 0, ref_h, ref_w, lq_h, lq_w):
                 preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
                                     x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
-            viz.finalize(np.array(ref_img), _vis_output)
+            viz.finalize(np.array(ref_img), np.array(lq_bicubic_img), _vis_output)
         else:
             preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
                                 x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
@@ -278,6 +279,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
         viz = AICGVisualizer(
             net_sr.unet, roi_mask=roi_mask,
             ref_h=ref_h, ref_w=ref_w,
+            lq_h=lq_h, lq_w=lq_w,
             tile_size=tile_size,
             fusion_blocks=args.get("fusion_blocks", "full"),
         )
@@ -348,7 +350,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
 
     # ── AICG 시각화 저장 ─────────────────────────────────────────────────────
     if viz is not None:
-        viz.finalize(np.array(ref_img), _vis_output)
+        viz.finalize(np.array(ref_img), np.array(lq_bicubic_img), _vis_output)
 
 
 def run_demo_tiled(lq_path, ref_path, output_path, args):
