@@ -346,8 +346,6 @@ class AICGVisualizer:
                 size=(ts, ts),
                 mode='bilinear', align_corners=False,
             ).squeeze()  # [ts, ts]
-            mn, mx = m2_up.min(), m2_up.max()
-            m2_up = (m2_up - mn) / (mx - mn + 1e-8)
             self.canvas2[ty:ty + th, tx:tx + tw] += m2_up[:th, :tw]
             self.cnt_lq [ty:ty + th, tx:tx + tw] += 1.0
 
@@ -428,17 +426,20 @@ class AICGVisualizer:
         g3 = (self.canvas3 / cnt_ref).numpy()
         cm_fn = plt.get_cmap(colormap)
 
-        def blend(hm: np.ndarray, base: np.ndarray) -> np.ndarray:
-            mn, mx = hm.min(), hm.max()
-            hm_n   = (hm - mn) / (mx - mn + 1e-8)
+        def blend(hm: np.ndarray, base: np.ndarray, is_gate: bool = False) -> np.ndarray:
+            if is_gate:
+                hm_n = hm.clip(0, 1)
+            else:
+                mn, mx = hm.min(), hm.max()
+                hm_n   = (hm - mn) / (mx - mn + 1e-8)
             hm_rgb = (cm_fn(hm_n) * 255).astype(np.uint8)[:, :, :3]
             return ((base.astype(np.float32) * 0.5 +
                      hm_rgb.astype(np.float32) * 0.5)
                     .clip(0, 255).astype(np.uint8))
 
-        b1 = blend(g1, ref_img)   # [ref_h, ref_w, 3]
-        b2 = blend(g2, lq_img)    # [lq_h,  lq_w,  3]
-        b3 = blend(g3, ref_img)   # [ref_h, ref_w, 3]
+        b1 = blend(g1, ref_img, is_gate=False)   # [ref_h, ref_w, 3]
+        b2 = blend(g2, lq_img,  is_gate=True)    # [lq_h,  lq_w,  3]
+        b3 = blend(g3, ref_img, is_gate=False)   # [ref_h, ref_w, 3]
 
         # 높이를 ref_h 로 통일
         target_h = ref_img.shape[0]
