@@ -61,6 +61,55 @@ roi_path: null   # 예) "./assets/roi/img_mask.png"  또는  "./assets/roi/"
 vis_output_path: null   # 예) "./assets/results/img_aicg_vis.png"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AICG Steering & Face Preprocessing (얼굴 ID 보존을 위한 강화 옵션)
+# ─────────────────────────────────────────────────────────────────────────────
+# 동작 조건:
+#   - roi_path 가 지정되어 있어야 함 (얼굴 영역 마스크).
+#   - enable_steering 과 enable_face_preproc 는 독립적으로 켤 수 있음.
+#
+# 권장 사용:
+#   enable_steering: true        # AICGSteerer Trust/Verify 강화
+#   enable_face_preproc: true    # 얼굴 영역 LR 픽셀에 동적 Blur + Monochrome noise
+#
+# 두 옵션의 역할:
+#   * face_preproc : 픽셀 공간 (VAE 통과 전) 에서 얼굴 영역의 구조적 단서를 흐리게 만들고
+#                    monochrome noise 주입. 모델이 LQ 의 손상된 얼굴 디테일에 의존하지 않고
+#                    Ref 로부터 ID 를 가져오도록 유도.
+#   * steering     : Attention 단계에서 직접 개입.  Trust(logit) 와 Verify(gate G) 를
+#                    얼굴 영역에서만 강제 증폭하여 Ref 의 영향을 명시적으로 끌어올림.
+enable_steering:     false
+enable_face_preproc: false
+
+# ── AICGSteerer 강화 배율 (effective = scale * individual) ────────────────
+# scale=1.0, trust_scale=1.0, verify_scale=1.0  → 완전한 no-op (회귀 위험 0)
+aicg_scale:          1.0    # 전역 multiplier: 0.5 ~ 1.5
+aicg_trust_scale:    1.8    # Trust (Q·K^T pre-softmax logit scale).  1.5 ~ 2.5 권장
+aicg_verify_scale:   2.0    # Verify (Gate G post-sigmoid scale).      1.5 ~ 3.0 권장.
+                            # 수치가 클수록 face 영역에서 G 가 1.0 에 클램프되어 강제 개방됨.
+
+# ── Face mask softening ─────────────────────────────────────────────────
+face_soft_mask:      true   # hard box → Gaussian blur soft mask (타일 경계 자연스러움)
+
+# ── 동적 Blur sigma (원본 해상도 face box 픽셀 크기에 비례) ─────────────
+# sigma = clamp(face_box_max_px * sigma_ratio, [sigma_min, sigma_max])
+# 예) face_box_max=256 → sigma = 0.02 * 256 = 5.12  (clamp 내)
+#     face_box_max=128 → sigma = 0.02 * 128 = 2.56
+face_sigma_ratio:    0.02
+face_sigma_min:      1.5
+face_sigma_max:      8.0
+
+# ── LR Image degradation params ─────────────────────────────────────────
+# face_noise_std : Monochrome Gaussian noise std (in [-1, 1] 공간)
+#                  RGB 독립 노이즈 X (chroma 노이즈 방지) → 단채널 broadcast
+#                  0.05 ~ 0.15 권장.  너무 크면 OOD, 너무 작으면 효과 미미.
+face_noise_std:      0.08
+
+# face_blend_ratio : degraded vs 원본 LR 의 혼합 비율 (도메인 시프트 방어)
+#                    0.0 = 전혀 degrade 안 함, 1.0 = 완전 degrade
+#                    0.4 ~ 0.7 권장.
+face_blend_ratio:    0.6
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 사용 예시 (CLI)
 # ─────────────────────────────────────────────────────────────────────────────
 #

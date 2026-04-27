@@ -2,6 +2,7 @@ import torch
 import os
 import argparse
 import sys
+from typing import Optional
 import numpy as np
 from PIL import Image, ImageOps
 from torchvision import transforms
@@ -12,6 +13,13 @@ from main_code.model.ref_model import RefModel
 from main_code.model.de_net import DEResNet
 from main_code.model.anymate_anyone.reference_attention import ReferenceNetAttention
 from visualize_aicg import AICGVisualizer
+from aicg_steering import AICGSteerer
+from face_preproc import (
+    compute_dynamic_sigma,
+    soften_mask,
+    degrade_lr_tile,
+    bbox_max_size_from_mask,
+)
 
 from ram.models.ram import ram
 from ram.models.ram_lora import ram as ram_deg
@@ -220,19 +228,88 @@ def _infer_single_image(lq_path, ref_path, output_path,
     print(f"  Prompt (ref): {prompt_ref}")
     print(f"  Prompt (src): {prompt_src}")
 
-    # ── ROI 마스크 로드 (시각화용, 옵션) ─────────────────────────────────────
+    # ── ROI 마스크 로드 (visualize / face_preproc / steering 공통 사용) ──────
     roi_mask = None
-    if visualize and roi_path and os.path.exists(roi_path):
+    if roi_path and os.path.exists(roi_path):
         roi_pil  = ImageOps.exif_transpose(Image.open(roi_path).convert("L"))
         roi_pil  = roi_pil.resize((lq_w, lq_h), Image.BILINEAR)
         roi_mask = np.array(roi_pil).astype(np.float32) / 255.0  # [lq_h, lq_w]
         print(f"  ROI mask loaded: {roi_path}")
 
+    # ── Face preprocessing / AICG steering 설정 로드 ─────────────────────────
+    enable_steering = bool(args.get("enable_steering", False))
+    enable_preproc  = bool(args.get("enable_face_preproc", False))
+
+    aicg_scale         = float(args.get("aicg_scale",        1.0))
+    aicg_trust_scale   = float(args.get("aicg_trust_scale",  1.0))
+    aicg_verify_scale  = float(args.get("aicg_verify_scale", 1.0))
+
+    face_sigma_ratio   = float(args.get("face_sigma_ratio",  0.02))
+    face_sigma_min     = float(args.get("face_sigma_min",    1.5))
+    face_sigma_max     = float(args.get("face_sigma_max",    8.0))
+    face_noise_std     = float(args.get("face_noise_std",    0.08))
+    face_blend_ratio   = float(args.get("face_blend_ratio",  0.6))
+    face_soft_mask_on  = bool(args.get("face_soft_mask",     True))
+
+    # Face box 의 원본(=SR canvas) 해상도 픽셀 크기 → dynamic sigma 산출
+    # (Tile 단위가 아닌 원본에서 한 번만 계산해 모든 tile 에 일관되게 적용)
+    face_box_max_px = bbox_max_size_from_mask(roi_mask) if roi_mask is not None else 0
+    dyn_sigma = compute_dynamic_sigma(
+        face_box_max_px, face_sigma_ratio, face_sigma_min, face_sigma_max,
+    ) if face_box_max_px > 0 else 0.0
+
+    soft_mask_global: Optional[torch.Tensor] = None
+    if roi_mask is not None and (enable_steering or enable_preproc):
+        hard_mask_t = torch.from_numpy(roi_mask).float()
+        if face_soft_mask_on and dyn_sigma > 0:
+            soft_mask_global = soften_mask(hard_mask_t, dyn_sigma)
+        else:
+            soft_mask_global = hard_mask_t.clamp(0, 1)
+        print(f"  Face box: max={face_box_max_px}px,  dyn_sigma={dyn_sigma:.2f},  "
+              f"soft_mask={'on' if face_soft_mask_on else 'off'},  "
+              f"steering={'on' if enable_steering else 'off'},  "
+              f"preproc={'on' if enable_preproc else 'off'}")
+
+    # AICGSteerer 초기화 (활성화된 경우에만)
+    steerer: Optional[AICGSteerer] = None
+    if enable_steering and soft_mask_global is not None:
+        steerer = AICGSteerer(
+            net_sr.unet,
+            scale=aicg_scale,
+            trust_scale=aicg_trust_scale,
+            verify_scale=aicg_verify_scale,
+            fusion_blocks=args.get("fusion_blocks", "full"),
+        )
+        print(f"  AICGSteerer: trust_eff={steerer.effective_trust_scale:.3f}, "
+              f"verify_eff={steerer.effective_verify_scale:.3f}")
+
     # ── Single-tile fast-path (upscaled LQ fits in one tile) ─────────────────
     if lq_h <= tile_size and lq_w <= tile_size:
         print("  SR canvas fits in one tile – running single inference.")
-        x_src_t = x_lq.unsqueeze(0).to(device, dtype=weight_dtype)
+
+        # 단일 타일에서도 face_preproc 동일하게 적용
+        x_src_processed = x_lq
+        if enable_preproc and soft_mask_global is not None and dyn_sigma > 0:
+            x_src_processed = degrade_lr_tile(
+                lq_tile_01=x_lq,
+                soft_mask=soft_mask_global,
+                sigma=dyn_sigma,
+                noise_std=face_noise_std,
+                degrad_blend_ratio=face_blend_ratio,
+            )
+
+        x_src_t = x_src_processed.unsqueeze(0).to(device, dtype=weight_dtype)
         x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
+
+        # 단일 타일에서도 steering 적용 (whole-image face mask 사용)
+        if steerer is not None and soft_mask_global is not None:
+            steerer.set_batch_face_masks([soft_mask_global])
+
+        def _run_infer():
+            return infer_batch(
+                net_sr, net_ref, net_de, ref_writer, ref_reader,
+                x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype,
+            )
 
         if visualize:
             # [Fix 1] 폴더 경로·None 모두 파일 경로로 변환
@@ -245,12 +322,21 @@ def _infer_single_image(lq_path, ref_path, output_path,
                 fusion_blocks=args.get("fusion_blocks", "full"),
             )
             with viz.capture_tile(0, 0, 0, 0, ref_h, ref_w, lq_h, lq_w):
-                preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
-                                    x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
+                if steerer is not None:
+                    with steerer.apply_steering():
+                        preds = _run_infer()
+                else:
+                    preds = _run_infer()
             viz.finalize(np.array(ref_img), np.array(lq_bicubic_img), _vis_output)
         else:
-            preds = infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
-                                x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype)
+            if steerer is not None:
+                with steerer.apply_steering():
+                    preds = _run_infer()
+            else:
+                preds = _run_infer()
+
+        if steerer is not None:
+            steerer.clear_batch_face_masks()
 
         pred_img = transforms.ToPILImage()((preds[0] * 0.5 + 0.5).clamp(0, 1).cpu())
         if args.get('align_method', 'wavelet') == 'wavelet':
@@ -285,21 +371,55 @@ def _infer_single_image(lq_path, ref_path, output_path,
         )
 
     # ── Tile inference loop ───────────────────────────────────────────────────
+    def _crop_pad_mask(mask: torch.Tensor, ty: int, tx: int) -> torch.Tensor:
+        """soft_mask_global 에서 [tile_size, tile_size] 크기로 crop+pad."""
+        crop = mask[ty:ty + tile_size, tx:tx + tile_size]
+        if crop.shape[0] == tile_size and crop.shape[1] == tile_size:
+            return crop
+        padded = torch.zeros(tile_size, tile_size, dtype=crop.dtype, device=crop.device)
+        padded[:crop.shape[0], :crop.shape[1]] = crop
+        return padded
+
     for batch_start in range(0, n_tiles, batch_sz):
         batch_pos = all_tiles[batch_start : batch_start + batch_sz]
         B = len(batch_pos)
         print(f"    tiles {batch_start + 1}-{batch_start + B} / {n_tiles}")
 
-        lq_tiles  = []
-        ref_tiles = []
+        lq_tiles    = []
+        ref_tiles   = []
         tile_coords = []   # (ty, tx, ry, rx, rth, rtw) per tile in batch
+        face_masks_per_tile: list = []
 
         for (ty, tx) in batch_pos:
             # LQ tile: cropped from the bicubic-upscaled LQ
-            lq_tiles.append(x_lq[:, ty:ty + tile_size, tx:tx + tile_size])
+            lq_tile = x_lq[:, ty:ty + tile_size, tx:tx + tile_size]
+
+            # Per-tile face mask (soft) – preproc / steering 양쪽에서 사용
+            face_tile_mask = None
+            if soft_mask_global is not None:
+                face_tile_mask = _crop_pad_mask(soft_mask_global, ty, tx)
+                # tile 영역에 얼굴 픽셀이 거의 없으면 None 으로 빠른 패스
+                if face_tile_mask.max().item() < 1e-3:
+                    face_tile_mask = None
+
+            # 픽셀 공간 LR degradation (원본 해상도 기준 dyn_sigma 사용 → blur 일관성)
+            if (enable_preproc and face_tile_mask is not None
+                    and dyn_sigma > 0):
+                # tile 외 영역은 zero-pad 됐을 수 있음 → 실제 LQ 영역 크기에 맞춰 crop
+                th_actual = lq_tile.shape[1]
+                tw_actual = lq_tile.shape[2]
+                m_for_deg = face_tile_mask[:th_actual, :tw_actual]
+                lq_tile = degrade_lr_tile(
+                    lq_tile_01=lq_tile,
+                    soft_mask=m_for_deg,
+                    sigma=dyn_sigma,
+                    noise_std=face_noise_std,
+                    degrad_blend_ratio=face_blend_ratio,
+                )
+            lq_tiles.append(lq_tile)
+            face_masks_per_tile.append(face_tile_mask)
 
             # Ref tile: proportionally cropped from the ORIGINAL ref (no upscaling).
-            # rth/rtw is the ref crop size that corresponds to one LQ tile.
             ry  = int(ty  * ref_h / lq_h)
             rx  = int(tx  * ref_w / lq_w)
             rth = max(1, round(tile_size * ref_h / lq_h))
@@ -322,17 +442,31 @@ def _infer_single_image(lq_path, ref_path, output_path,
         prompts_ref_b = [prompt_ref] * B
         prompts_src_b = [prompt_src] * B
 
-        if viz is not None:
-            with viz.capture_batch(tile_coords, lq_h, lq_w):
-                predictions = infer_batch(
-                    net_sr, net_ref, net_de, ref_writer, ref_reader,
-                    x_src_b, x_ref_b, prompts_src_b, prompts_ref_b, weight_dtype,
-                )
-        else:
-            predictions = infer_batch(
+        # AICGSteerer 에 batch face masks 등록 (steering 컨텍스트 안에서만 효력)
+        if steerer is not None:
+            steerer.set_batch_face_masks(face_masks_per_tile)
+
+        def _run_batch():
+            return infer_batch(
                 net_sr, net_ref, net_de, ref_writer, ref_reader,
                 x_src_b, x_ref_b, prompts_src_b, prompts_ref_b, weight_dtype,
             )
+
+        # viz / steering 이중 컨텍스트
+        if viz is not None and steerer is not None:
+            with viz.capture_batch(tile_coords, lq_h, lq_w), steerer.apply_steering():
+                predictions = _run_batch()
+        elif viz is not None:
+            with viz.capture_batch(tile_coords, lq_h, lq_w):
+                predictions = _run_batch()
+        elif steerer is not None:
+            with steerer.apply_steering():
+                predictions = _run_batch()
+        else:
+            predictions = _run_batch()
+
+        if steerer is not None:
+            steerer.clear_batch_face_masks()
 
         for k, (ty, tx) in enumerate(batch_pos):
             w    = tile_weight_map(tile_size, overlap, ty, tx, lq_h, lq_w).to(device)
@@ -498,6 +632,24 @@ if __name__ == "__main__":
                              help="ROI 마스크 이미지 경로 (grayscale PNG, LQ 해상도).")
     demo_parser.add_argument("--vis_output_path", type=str,  default=None,
                              help="시각화 PNG 저장 경로 (미지정 시 output_path 옆에 자동 생성).")
+
+    # ── AICG Steering / Face Preprocessing flags ────────────────────────────
+    demo_parser.add_argument("--enable_steering",     action="store_true", default=None,
+                             help="AICGSteerer (Trust logit / Verify gate forcing) 활성화.")
+    demo_parser.add_argument("--enable_face_preproc", action="store_true", default=None,
+                             help="Face Soft mask 영역 LR Blur+Monochrome noise 전처리 활성화.")
+    demo_parser.add_argument("--aicg_scale",          type=float, default=None,
+                             help="전체 강화 배율 (trust/verify 양쪽에 곱함, default 1.0).")
+    demo_parser.add_argument("--aicg_trust_scale",    type=float, default=None,
+                             help="Trust(logit) 개별 배율.")
+    demo_parser.add_argument("--aicg_verify_scale",   type=float, default=None,
+                             help="Verify(gate G) 개별 배율 (sigma 통과 후 clamp).")
+    demo_parser.add_argument("--face_sigma_ratio",    type=float, default=None,
+                             help="원본 face box 픽셀당 sigma 비율 (default 0.02).")
+    demo_parser.add_argument("--face_noise_std",      type=float, default=None,
+                             help="Monochrome 가우시안 노이즈 std ([-1,1] 공간, default 0.08).")
+    demo_parser.add_argument("--face_blend_ratio",    type=float, default=None,
+                             help="degrad_blend_ratio: 0=원본, 1=완전 degraded (default 0.6).")
 
     demo_args, unknown = demo_parser.parse_known_args()
 
