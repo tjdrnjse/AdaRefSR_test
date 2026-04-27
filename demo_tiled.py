@@ -591,6 +591,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
             )
 
         os.makedirs(output_path, exist_ok=True)
+        _out_dir_for_cfg = output_path
         print(f">>> Folder mode: {len(image_pairs)} image pair(s) found.")
         print(f"    lq_path    : {lq_path}")
         print(f"    ref_path   : {ref_path}")
@@ -603,11 +604,13 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
         if os.path.isdir(output_path):
             fname = os.path.basename(lq_path)
             out_file = os.path.join(output_path, fname)
+            _out_dir_for_cfg = output_path
         else:
             out_dir = os.path.dirname(output_path)
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
             out_file = output_path
+            _out_dir_for_cfg = out_dir or "."
 
         image_pairs = [(lq_path, ref_path, out_file, roi_path)]
         print(f">>> Single-image mode: {os.path.basename(lq_path)}")
@@ -617,6 +620,13 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
             "lq_path and ref_path must both be files or both be directories. "
             f"Got lq_is_dir={lq_is_dir}, ref_is_dir={ref_is_dir}"
         )
+
+    # ── 실험 기록: effective config (YAML + CLI override 반영) 를 output 디렉터리에 저장 ──
+    _cfg_src  = args.get("config_path", None)
+    _cfg_name = os.path.basename(_cfg_src) if _cfg_src else "run_config.yaml"
+    _cfg_save = os.path.join(_out_dir_for_cfg, _cfg_name)
+    OmegaConf.save(args, _cfg_save)
+    print(f">>> Config saved : {_cfg_save}")
 
     # ── 모델 로드 (전체 처리에 걸쳐 한 번만) ─────────────────────────────────
     print(">>> Loading models...")
@@ -712,5 +722,8 @@ if __name__ == "__main__":
             raise ValueError(
                 f"'{key}' is required. Set it via --{key} or in the YAML config."
             )
+
+    # 실험 기록용: run_demo_tiled 내부에서 output 디렉터리에 config 사본 저장
+    final_cfg.config_path = demo_args.config
 
     run_demo_tiled(final_cfg.lq_path, final_cfg.ref_path, final_cfg.output_path, final_cfg)
