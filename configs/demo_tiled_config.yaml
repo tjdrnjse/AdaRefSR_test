@@ -109,6 +109,14 @@ face_noise_std:      0.08
 #                    0.4 ~ 0.7 권장.
 face_blend_ratio:    0.6
 
+# ── Degraded LR 저장 옵션 ──────────────────────────────────────────────────
+# save_degraded_lr: true 로 설정하면 blur/noise 가 적용된 LR 이미지를 output_path
+#   와 같은 디렉터리에 <stem><suffix>.png 로 저장.
+#   - enable_face_preproc 가 true 일 때만 유효 (false 이면 원본 LQ와 동일하므로 저장 생략).
+# degraded_lr_suffix: 저장 파일명 접미사 (확장자 제외).
+save_degraded_lr:    false
+degraded_lr_suffix:  "_degrad_lr"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 사용 예시 (CLI)
 # ─────────────────────────────────────────────────────────────────────────────

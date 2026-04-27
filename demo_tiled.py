@@ -251,6 +251,16 @@ def _infer_single_image(lq_path, ref_path, output_path,
     face_blend_ratio   = float(args.get("face_blend_ratio",  0.6))
     face_soft_mask_on  = bool(args.get("face_soft_mask",     True))
 
+    save_degraded_lr   = bool(args.get("save_degraded_lr",   False))
+    degraded_lr_suffix = str(args.get("degraded_lr_suffix",  "_degrad_lr"))
+
+    # Degraded LR output path: <output_dir>/<stem><suffix>.png
+    _degrad_stem = os.path.splitext(os.path.basename(output_path))[0]
+    degrad_out   = os.path.join(
+        os.path.dirname(os.path.abspath(output_path)),
+        _degrad_stem + degraded_lr_suffix + ".png",
+    )
+
     # Face box 의 원본(=SR canvas) 해상도 픽셀 크기 → dynamic sigma 산출
     # (Tile 단위가 아닌 원본에서 한 번만 계산해 모든 tile 에 일관되게 적용)
     face_box_max_px = bbox_max_size_from_mask(roi_mask) if roi_mask is not None else 0
@@ -297,6 +307,12 @@ def _infer_single_image(lq_path, ref_path, output_path,
                 noise_std=face_noise_std,
                 degrad_blend_ratio=face_blend_ratio,
             )
+
+        # Degraded LR 저장 (enable_preproc 가 True 이고 실제로 degradation 이 적용된 경우)
+        if save_degraded_lr and enable_preproc and soft_mask_global is not None and dyn_sigma > 0:
+            degrad_img = transforms.ToPILImage()(x_src_processed.clamp(0, 1).cpu())
+            degrad_img.save(degrad_out)
+            print(f"  Saved degraded LR: {degrad_out}")
 
         x_src_t = x_src_processed.unsqueeze(0).to(device, dtype=weight_dtype)
         x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
@@ -356,6 +372,13 @@ def _infer_single_image(lq_path, ref_path, output_path,
     # Output accumulators at the SR canvas size (float32 for precision)
     pred_acc   = torch.zeros(3, lq_h, lq_w, dtype=torch.float32, device=device)
     weight_acc = torch.zeros(1, lq_h, lq_w, dtype=torch.float32, device=device)
+
+    # Degraded LR accumulators (CPU, only allocated when needed)
+    degrad_acc: Optional[torch.Tensor] = None
+    degrad_wt:  Optional[torch.Tensor] = None
+    if save_degraded_lr and enable_preproc:
+        degrad_acc = torch.zeros(3, lq_h, lq_w, dtype=torch.float32)
+        degrad_wt  = torch.zeros(1, lq_h, lq_w, dtype=torch.float32)
 
     # ── 시각화 캔버스 초기화 ─────────────────────────────────────────────────
     viz = None
@@ -474,6 +497,12 @@ def _infer_single_image(lq_path, ref_path, output_path,
             pred_acc[:,   ty:ty + tile_size, tx:tx + tile_size] += pred * w
             weight_acc[:, ty:ty + tile_size, tx:tx + tile_size] += w
 
+            if degrad_acc is not None:
+                w_cpu = tile_weight_map(tile_size, overlap, ty, tx, lq_h, lq_w)
+                dt    = lq_tiles[k].float().cpu().clamp(0, 1)
+                degrad_acc[:, ty:ty + tile_size, tx:tx + tile_size] += dt * w_cpu
+                degrad_wt[:,  ty:ty + tile_size, tx:tx + tile_size] += w_cpu
+
     # ── Merge tiles & save ────────────────────────────────────────────────────
     result     = (pred_acc / weight_acc.clamp(min=1e-6)).clamp(0, 1)
     result_img = transforms.ToPILImage()(result.cpu())
@@ -481,6 +510,12 @@ def _infer_single_image(lq_path, ref_path, output_path,
         result_img = wavelet_color_fix(result_img, lq_bicubic_img)
     result_img.resize((orig_w * scale, orig_h * scale), Image.BICUBIC).save(output_path)
     print(f"  Saved: {output_path}  ({orig_w * scale}x{orig_h * scale})")
+
+    # ── Degraded LR 저장 (multi-tile) ────────────────────────────────────────
+    if degrad_acc is not None:
+        degrad_merged = (degrad_acc / degrad_wt.clamp(min=1e-6)).clamp(0, 1)
+        transforms.ToPILImage()(degrad_merged).save(degrad_out)
+        print(f"  Saved degraded LR: {degrad_out}")
 
     # ── AICG 시각화 저장 ─────────────────────────────────────────────────────
     if viz is not None:
@@ -650,6 +685,10 @@ if __name__ == "__main__":
                              help="Monochrome 가우시안 노이즈 std ([-1,1] 공간, default 0.08).")
     demo_parser.add_argument("--face_blend_ratio",    type=float, default=None,
                              help="degrad_blend_ratio: 0=원본, 1=완전 degraded (default 0.6).")
+    demo_parser.add_argument("--save_degraded_lr",    action="store_true", default=None,
+                             help="blur/noise 가 적용된 LR 이미지를 output_path 옆에 저장.")
+    demo_parser.add_argument("--degraded_lr_suffix",  type=str, default=None,
+                             help="Degraded LR 파일명 접미사 (default '_degrad_lr').")
 
     demo_args, unknown = demo_parser.parse_known_args()
 
