@@ -243,6 +243,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
     aicg_scale         = float(args.get("aicg_scale",        1.0))
     aicg_trust_scale   = float(args.get("aicg_trust_scale",  1.0))
     aicg_verify_scale  = float(args.get("aicg_verify_scale", 1.0))
+    aicg_force_verify  = bool(args.get("aicg_force_verify",  False))
 
     face_sigma_ratio   = float(args.get("face_sigma_ratio",  0.02))
     face_sigma_min     = float(args.get("face_sigma_min",    1.5))
@@ -288,6 +289,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
             scale=aicg_scale,
             trust_scale=aicg_trust_scale,
             verify_scale=aicg_verify_scale,
+            force_verify=aicg_force_verify,
             fusion_blocks=args.get("fusion_blocks", "full"),
         )
         print(f"  AICGSteerer: trust_eff={steerer.effective_trust_scale:.3f}, "
@@ -697,6 +699,8 @@ if __name__ == "__main__":
                              help="Trust(logit) 개별 배율.")
     demo_parser.add_argument("--aicg_verify_scale",   type=float, default=None,
                              help="Verify(gate G) 개별 배율 (sigma 통과 후 clamp).")
+    demo_parser.add_argument("--aicg_force_verify",   action="store_true", default=None,
+                             help="face 영역 gate 를 무조건 1.0 으로 강제 (Hard Override).")
     demo_parser.add_argument("--face_sigma_ratio",    type=float, default=None,
                              help="원본 face box 픽셀당 sigma 비율 (default 0.02).")
     demo_parser.add_argument("--face_noise_std",      type=float, default=None,

@@ -129,10 +129,19 @@ class SteeredReferenceAttnProcessor:
                 # broadcast across heads → [B*h, L_q]
                 face_mask_q_bh = face_mask_q_2d.repeat_interleave(h_eff, dim=0)
 
-        # ── Verify intervention: G[face_mask] ← clamp(G*verify_scale, 0, 1)
-        if steer and face_mask_q_2d is not None and self.steerer.effective_verify_scale != 1.0:
-            forced = (gate * self.steerer.effective_verify_scale).clamp(0.0, 1.0)
-            gate   = torch.where(face_mask_q_2d, forced, gate)
+        # ── Verify intervention: face_mask 영역에 한해 gate 값을 조정 ─────────
+        #   조건 A  force_verify=True  → 무조건 1.0 (Hard Override, verify_scale 무관)
+        #   조건 B  force_verify=False + effective_verify_scale != 1.0
+        #                              → clamp(gate * verify_scale, 0, 1)  (기존 방식)
+        if steer and face_mask_q_2d is not None:
+            if self.steerer.force_verify:
+                forced = torch.ones_like(gate)                                # Hard Override
+            elif self.steerer.effective_verify_scale != 1.0:
+                forced = (gate * self.steerer.effective_verify_scale).clamp(0.0, 1.0)
+            else:
+                forced = None
+            if forced is not None:
+                gate = torch.where(face_mask_q_2d, forced, gate)
 
         # ── Main attention (Eq.2)  – Trust intervention applied if needed ──
         chunk_size = 1024
@@ -240,6 +249,7 @@ class AICGSteerer:
         scale:         float = 1.0,
         trust_scale:   float = 1.0,
         verify_scale:  float = 1.0,
+        force_verify:  bool  = False,
         fusion_blocks: str   = "full",
         verbose:       bool  = False,
     ):
@@ -247,6 +257,8 @@ class AICGSteerer:
         self.scale         = float(scale)
         self.trust_scale   = float(trust_scale)
         self.verify_scale  = float(verify_scale)
+        # force_verify=True: face_mask 영역 gate 를 verify_scale 무관하게 무조건 1.0 으로 강제
+        self.force_verify  = bool(force_verify)
         self.fusion_blocks = fusion_blocks
         self.verbose       = verbose
 

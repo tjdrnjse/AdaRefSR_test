@@ -86,6 +86,10 @@ aicg_scale:          1.0    # 전역 multiplier: 0.5 ~ 1.5
 aicg_trust_scale:    1.8    # Trust (Q·K^T pre-softmax logit scale).  1.5 ~ 2.5 권장
 aicg_verify_scale:   2.0    # Verify (Gate G post-sigmoid scale).      1.5 ~ 3.0 권장.
                             # 수치가 클수록 face 영역에서 G 가 1.0 에 클램프되어 강제 개방됨.
+# aicg_force_verify: true 이면 verify_scale 값과 무관하게 face 영역 gate 를 무조건 1.0 으로 강제.
+#   false(기본) → clamp(gate * verify_scale, 0, 1)  (soft scaling)
+#   true        → gate = 1.0 무조건 (Hard Override, 가장 강한 Ref 강제 개방)
+aicg_force_verify:   false
 
 # ── Face mask softening ─────────────────────────────────────────────────
 face_soft_mask:      true   # hard box → Gaussian blur soft mask (타일 경계 자연스러움)
