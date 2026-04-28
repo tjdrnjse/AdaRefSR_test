@@ -330,12 +330,16 @@ def _infer_single_image(lq_path, ref_path, output_path,
         if visualize:
             # [Fix 1] 폴더 경로·None 모두 파일 경로로 변환
             _vis_output = _resolve_vis_path(vis_output_path, output_path)
+            # steerer 가 있으면 probs/gate 캐싱 활성화 → viz 가 개입 결과를 반영
+            if steerer is not None:
+                steerer.capture_for_viz = True
             viz = AICGVisualizer(
                 net_sr.unet, roi_mask=roi_mask,
                 ref_h=ref_h, ref_w=ref_w,
                 lq_h=lq_h, lq_w=lq_w,
                 tile_size=tile_size,
                 fusion_blocks=args.get("fusion_blocks", "full"),
+                steerer=steerer,
             )
             with viz.capture_tile(0, 0, 0, 0, ref_h, ref_w, lq_h, lq_w):
                 if steerer is not None:
@@ -385,12 +389,16 @@ def _infer_single_image(lq_path, ref_path, output_path,
     if visualize:
         # [Fix 1] 폴더 경로·None 모두 파일 경로로 변환
         _vis_output = _resolve_vis_path(vis_output_path, output_path)
+        # steerer 가 있으면 probs/gate 캐싱 활성화 → viz 가 개입 결과를 반영
+        if steerer is not None:
+            steerer.capture_for_viz = True
         viz = AICGVisualizer(
             net_sr.unet, roi_mask=roi_mask,
             ref_h=ref_h, ref_w=ref_w,
             lq_h=lq_h, lq_w=lq_w,
             tile_size=tile_size,
             fusion_blocks=args.get("fusion_blocks", "full"),
+            steerer=steerer,
         )
 
     # ── Tile inference loop ───────────────────────────────────────────────────

@@ -36,34 +36,46 @@ from PIL import Image
 # ============================================================================
 
 def compute_aicg_maps(
-    query:   torch.Tensor,   # [h, L_q,   C']  단일 타일 (B=1 슬라이스)
-    key:     torch.Tensor,   # [h, L_ref,  C']
-    gate:    torch.Tensor,   # [1, L_q]         G (Eq.6)
-    roi_vec: torch.Tensor,   # [L_q]            ROI 마스크 (0~1)
-    scale:   float,          # 1/√C'
+    query:   Optional[torch.Tensor],   # [h, L_q,   C'] – None if probs provided
+    key:     Optional[torch.Tensor],   # [h, L_ref,  C'] – None if probs provided
+    gate:    torch.Tensor,             # [1, L_q]         G (Eq.6, post-intervention)
+    roi_vec: torch.Tensor,             # [L_q]            ROI 마스크 (0~1)
+    scale:   float,                    # 1/√C' – unused when probs provided
+    probs:   Optional[torch.Tensor] = None,  # [h, L_q, L_ref] – pre-computed A_RA
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     A_RA(Eq.2)를 헤드별 계산 후 즉시 [L_ref]로 투영·삭제 (Map1, Map3).
     Map2 는 Attention 투영 없이 LQ 공간의 (G * ROI) 를 2D로 반환.
+
+    probs 가 주어지면 A_RA 재연산을 생략하고 steerer 캐시 값을 그대로 사용.
+    probs 가 None 이면 (query, key, scale) 로 fallback 재연산.
 
     Returns:
       map1 : [L_ref]   Trust    – ROI → Ref 공간
       map2 : [L_q]     Verify   – G×ROI 1D (stitch 시 2D 변환)
       map3 : [L_ref]   Combined – (ROI×G) → Ref 공간
     """
-    device     = query.device
-    num_heads  = query.shape[0]
-    L_ref      = key.shape[1]
-    L_q        = query.shape[1]
-    ls_q       = int(math.sqrt(L_q))
+    # 디바이스 결정: probs/gate 기준 (query 없어도 동작)
+    if probs is not None:
+        device    = probs.device
+        num_heads = probs.shape[0]   # h
+        L_q       = probs.shape[1]   # L_q
+        L_ref     = probs.shape[2]   # L_ref
+    else:
+        assert query is not None and key is not None
+        device    = query.device
+        num_heads = query.shape[0]
+        L_q       = query.shape[1]
+        L_ref     = key.shape[1]
+
+    ls_q = int(math.sqrt(L_q))
 
     roi = roi_vec.float().to(device)
     if roi.shape[0] != L_q:
         ls_src = int(math.sqrt(roi.shape[0]))
-        ls_dst = ls_q
         roi = F.interpolate(
             roi.reshape(1, 1, ls_src, ls_src),
-            size=(ls_dst, ls_dst),
+            size=(ls_q, ls_q),
             mode='bilinear',
             align_corners=False,
         ).reshape(-1).to(device)
@@ -76,14 +88,23 @@ def compute_aicg_maps(
     acc1 = torch.zeros(L_ref, dtype=torch.float32, device=device)
     acc3 = torch.zeros(L_ref, dtype=torch.float32, device=device)
 
-    q32 = query.float()
-    k32 = key.float()
-
-    for h_idx in range(num_heads):
-        a_ra_h = torch.softmax(q32[h_idx] @ k32[h_idx].T * scale, dim=-1)
-        acc1 += roi   @ a_ra_h
-        acc3 += roi_g @ a_ra_h
-        del a_ra_h
+    if probs is not None:
+        # ── Steerer 캐시 경로: A_RA 재연산 없이 직접 투영 ──────────────────
+        for h_idx in range(num_heads):
+            # a_ra_h: [L_q, L_ref] – Trust-intervened attention probabilities
+            a_ra_h = probs[h_idx].float().to(device)
+            acc1 += roi   @ a_ra_h
+            acc3 += roi_g @ a_ra_h
+            del a_ra_h
+    else:
+        # ── Fallback 경로: (query, key) 로 A_RA 재연산 ─────────────────────
+        q32 = query.float()
+        k32 = key.float()
+        for h_idx in range(num_heads):
+            a_ra_h = torch.softmax(q32[h_idx] @ k32[h_idx].T * scale, dim=-1)
+            acc1 += roi   @ a_ra_h
+            acc3 += roi_g @ a_ra_h
+            del a_ra_h
 
     return acc1 / num_heads, map2, acc3 / num_heads
 
@@ -174,9 +195,11 @@ class AICGVisualizer:
         lq_w:          int,
         tile_size:     int = 512,
         fusion_blocks: str = "full",
+        steerer=None,  # Optional[AICGSteerer] – inject to use cached probs/gate
     ):
         self.unet      = unet
         self.roi_mask  = roi_mask
+        self.steerer   = steerer   # if provided, hook reads steerer._last_probs/_last_gate
         self.ref_h     = ref_h
         self.ref_w     = ref_w
         self.lq_h      = lq_h
@@ -231,11 +254,56 @@ class AICGVisualizer:
         batch_accs = self._batch_accs
         batch_roi  = self._batch_roi_pix
         ts         = self.tile_size
+        steerer    = self.steerer   # may be None
 
         for attn_ref in self._attn_refs:
 
             def _make_hook(ar):
                 def hook(module, args, kwargs, output):
+
+                    # ── 경로 1: Steerer 캐시 읽기 (Trust/Verify 개입 결과 반영) ──
+                    # SteeredReferenceAttnProcessor 가 이 forward 직전에 실행되고
+                    # probs [B*h, L_q, L_ref] / gate [B, L_q] 를 CPU 에 캐싱해 둔 상태.
+                    if (
+                        steerer is not None
+                        and steerer.capture_for_viz
+                        and steerer._last_probs is not None
+                        and steerer._last_gate  is not None
+                    ):
+                        # probs: [B*h, L_q, L_ref] – Trust-intervened attention map (cpu)
+                        # gate : [B,   L_q]         – Verify-intervened gate         (cpu)
+                        cached_probs = steerer._last_probs
+                        cached_gate  = steerer._last_gate
+                        B_val   = cached_gate.shape[0]
+                        h_eff   = cached_probs.shape[0] // B_val
+                        L_q_act = cached_probs.shape[1]
+                        ls_act  = int(math.sqrt(L_q_act))
+
+                        for i in range(min(B_val, len(batch_accs))):
+                            h0, h1   = i * h_eff, (i + 1) * h_eff
+                            probs_i  = cached_probs[h0:h1]       # [h, L_q, L_ref]
+                            gate_i   = cached_gate[i:i + 1]      # [1, L_q]
+
+                            roi_pix = batch_roi[i]
+                            if roi_pix is not None:
+                                roi_vec = F.interpolate(
+                                    roi_pix.unsqueeze(0).unsqueeze(0).float(),
+                                    size=(ls_act, ls_act),
+                                    mode='area',
+                                ).squeeze().reshape(-1)           # cpu
+                            else:
+                                roi_vec = torch.ones(L_q_act)
+
+                            m1, m2, m3 = compute_aicg_maps(
+                                query=None, key=None,
+                                gate=gate_i, roi_vec=roi_vec,
+                                scale=0.0, probs=probs_i,
+                            )
+                            batch_accs[i].update(m1, m2, m3)
+                        return  # steerer 경로 완료 – fallback 생략
+
+                    # ── 경로 2: Fallback – 순정 수식으로 재연산 ──────────────────
+                    # (steerer 없음 또는 capture_for_viz=False 인 경우)
                     hs  = args[0] if len(args) > 0 else kwargs.get('hidden_states')
                     enc = kwargs.get('encoder_hidden_states')
                     if hs is None or enc is None:
@@ -258,9 +326,8 @@ class AICGVisualizer:
                             torch.bmm(ts_k, k.transpose(-1, -2)) * ar.scale, dim=-1)
                         ksum   = torch.bmm(s_ref, k)
                         smap_logits = torch.bmm(q, ksum.transpose(-1, -2)) * ar.scale
-                        smap        = torch.softmax(smap_logits, dim=-1)   # Attention Fusion 용
                         gate        = torch.sigmoid(
-                            ar.batch_to_head_dim(smap_logits).mean(dim=-1))  # Gate 예측 용  [B, L_q]
+                            ar.batch_to_head_dim(smap_logits).mean(dim=-1))  # [B, L_q]
 
                         actual_heads = q.shape[0] // B_val
                         L_q_actual   = q.shape[1]
@@ -270,7 +337,7 @@ class AICGVisualizer:
                             h0, h1 = i * actual_heads, (i + 1) * actual_heads
                             q_i    = q   [h0:h1]
                             k_i    = k   [h0:h1]
-                            gate_i = gate[i:i+1]
+                            gate_i = gate[i:i + 1]
 
                             roi_pix = batch_roi[i]
                             if roi_pix is not None:
@@ -283,7 +350,9 @@ class AICGVisualizer:
                                 roi_vec = torch.ones(L_q_actual, device=q.device)
 
                             m1, m2, m3 = compute_aicg_maps(
-                                q_i, k_i, gate_i, roi_vec, ar.scale
+                                query=q_i, key=k_i,
+                                gate=gate_i, roi_vec=roi_vec,
+                                scale=ar.scale,
                             )
                             batch_accs[i].update(m1, m2, m3)
 

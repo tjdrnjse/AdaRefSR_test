@@ -66,6 +66,11 @@ class SteeredReferenceAttnProcessor:
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("Requires PyTorch >= 2.0 for scaled_dot_product_attention.")
         self.steerer = steerer
+        # Per-layer visualization cache (overwritten each forward, read by hook synchronously)
+        # _last_probs : [B*h, L_q, L_ref]  Trust attention map (post-intervention)
+        # _last_gate  : [B,   L_q]          Verify gate         (post-intervention)
+        self._last_probs: Optional[torch.Tensor] = None
+        self._last_gate:  Optional[torch.Tensor] = None
 
     # ────────────────────────────────────────────────────────────────────────
 
@@ -138,19 +143,28 @@ class SteeredReferenceAttnProcessor:
             and self.steerer.effective_trust_scale != 1.0
         )
 
+        _viz = self.steerer.capture_for_viz
+
         if trust_active:
             # 명시적 softmax 경로 (logit 스케일링 가능)
             ts = self.steerer.effective_trust_scale
+            _probs_chunks: List[torch.Tensor] = []
             for i in range(0, L_q, chunk_size):
-                q_chunk = query[:, i:i + chunk_size, :]                        # [B*h, c, C']
-                scores  = torch.bmm(q_chunk, key.transpose(-1, -2)) * attn.scale
-                m_chunk = face_mask_q_bh[:, i:i + chunk_size].unsqueeze(-1)    # [B*h, c, 1]
-                scores  = torch.where(m_chunk, scores * ts, scores)
-                probs   = torch.softmax(scores, dim=-1)
-                out_c   = torch.bmm(probs, value)
+                q_chunk  = query[:, i:i + chunk_size, :]                       # [B*h, c, C']
+                scores   = torch.bmm(q_chunk, key.transpose(-1, -2)) * attn.scale
+                m_chunk  = face_mask_q_bh[:, i:i + chunk_size].unsqueeze(-1)   # [B*h, c, 1]
+                scores   = torch.where(m_chunk, scores * ts, scores)
+                probs_c  = torch.softmax(scores, dim=-1)                        # [B*h, c, L_ref]
+                out_c    = torch.bmm(probs_c, value)
                 output[:, i:i + chunk_size, :] = out_c
+                if _viz:
+                    _probs_chunks.append(probs_c.detach().cpu())
+            # shape: [B*h, L_q, L_ref]  Trust attention map (post-trust-intervention)
+            if _viz and _probs_chunks:
+                self.steerer._last_probs = torch.cat(_probs_chunks, dim=1)
         else:
             # SDPA fast-path (수치적으로 원본과 동일)
+            _sdpa_probs: List[torch.Tensor] = []
             for i in range(0, L_q, chunk_size):
                 q_chunk = query[:, i:i + chunk_size, :]
                 out_c   = F.scaled_dot_product_attention(
@@ -159,6 +173,20 @@ class SteeredReferenceAttnProcessor:
                     is_causal=False,
                 )
                 output[:, i:i + chunk_size, :] = out_c
+                if _viz:
+                    # SDPA는 probs를 노출하지 않으므로 별도로 계산 (viz 전용, forward 결과와 무관)
+                    with torch.no_grad():
+                        s_c = torch.bmm(
+                            q_chunk.float(), key.float().transpose(-1, -2)
+                        ) * attn.scale                                          # [B*h, c, L_ref]
+                        _sdpa_probs.append(torch.softmax(s_c, dim=-1).cpu())
+            # shape: [B*h, L_q, L_ref]  Trust attention map (no trust intervention → unmodified)
+            if _viz and _sdpa_probs:
+                self.steerer._last_probs = torch.cat(_sdpa_probs, dim=1)
+
+        # Verify-intervened gate: [B, L_q]  (post-verify-intervention)
+        if _viz:
+            self.steerer._last_gate = gate.detach().cpu()
 
         weighted_values = output
 
@@ -224,6 +252,15 @@ class AICGSteerer:
 
         # per-batch (re-set every tile-batch)
         self._batch_face_masks: Optional[List[Optional[torch.Tensor]]] = None
+
+        # visualization cache: set True to make SteeredReferenceAttnProcessor
+        # cache probs/gate each layer forward (read by AICGVisualizer hook)
+        self.capture_for_viz: bool = False
+        # Layer-level cache (overwritten per-layer, read synchronously by hook)
+        # _last_probs : [B*h, L_q, L_ref]  Trust attention map (post-intervention), cpu
+        # _last_gate  : [B,   L_q]          Verify gate         (post-intervention), cpu
+        self._last_probs: Optional[torch.Tensor] = None
+        self._last_gate:  Optional[torch.Tensor] = None
 
         # active during apply_steering() context
         self._active                  = False
