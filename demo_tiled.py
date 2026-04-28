@@ -295,28 +295,27 @@ def _infer_single_image(lq_path, ref_path, output_path,
         print(f"  AICGSteerer: trust_eff={steerer.effective_trust_scale:.3f}, "
               f"verify_eff={steerer.effective_verify_scale:.3f}")
 
+    # ── Global face preprocessing (전체 SR canvas 에서 1회만 수행) ──────────────
+    # 타일 경계 blur 아티팩트 방지 + 루프 내 CPU-GPU sync 제거
+    x_lq_processed = x_lq
+    if enable_preproc and soft_mask_global is not None and dyn_sigma > 0:
+        x_lq_processed = degrade_lr_tile(
+            lq_tile_01=x_lq,
+            soft_mask=soft_mask_global,
+            sigma=dyn_sigma,
+            noise_std=face_noise_std,
+            degrad_blend_ratio=face_blend_ratio,
+        )
+        if save_degraded_lr:
+            degrad_img = transforms.ToPILImage()(x_lq_processed.clamp(0, 1).cpu())
+            degrad_img.save(degrad_out)
+            print(f"  Saved degraded LR: {degrad_out}")
+
     # ── Single-tile fast-path (upscaled LQ fits in one tile) ─────────────────
     if lq_h <= tile_size and lq_w <= tile_size:
         print("  SR canvas fits in one tile – running single inference.")
 
-        # 단일 타일에서도 face_preproc 동일하게 적용
-        x_src_processed = x_lq
-        if enable_preproc and soft_mask_global is not None and dyn_sigma > 0:
-            x_src_processed = degrade_lr_tile(
-                lq_tile_01=x_lq,
-                soft_mask=soft_mask_global,
-                sigma=dyn_sigma,
-                noise_std=face_noise_std,
-                degrad_blend_ratio=face_blend_ratio,
-            )
-
-        # Degraded LR 저장 (enable_preproc 가 True 이고 실제로 degradation 이 적용된 경우)
-        if save_degraded_lr and enable_preproc and soft_mask_global is not None and dyn_sigma > 0:
-            degrad_img = transforms.ToPILImage()(x_src_processed.clamp(0, 1).cpu())
-            degrad_img.save(degrad_out)
-            print(f"  Saved degraded LR: {degrad_out}")
-
-        x_src_t = x_src_processed.unsqueeze(0).to(device, dtype=weight_dtype)
+        x_src_t = x_lq_processed.unsqueeze(0).to(device, dtype=weight_dtype)
         x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
 
         # 단일 타일에서도 steering 적용 (whole-image face mask 사용)
@@ -379,13 +378,6 @@ def _infer_single_image(lq_path, ref_path, output_path,
     pred_acc   = torch.zeros(3, lq_h, lq_w, dtype=torch.float32, device=device)
     weight_acc = torch.zeros(1, lq_h, lq_w, dtype=torch.float32, device=device)
 
-    # Degraded LR accumulators (CPU, only allocated when needed)
-    degrad_acc: Optional[torch.Tensor] = None
-    degrad_wt:  Optional[torch.Tensor] = None
-    if save_degraded_lr and enable_preproc:
-        degrad_acc = torch.zeros(3, lq_h, lq_w, dtype=torch.float32)
-        degrad_wt  = torch.zeros(1, lq_h, lq_w, dtype=torch.float32)
-
     # ── 시각화 캔버스 초기화 ─────────────────────────────────────────────────
     viz = None
     if visualize:
@@ -424,31 +416,16 @@ def _infer_single_image(lq_path, ref_path, output_path,
         face_masks_per_tile: list = []
 
         for (ty, tx) in batch_pos:
-            # LQ tile: cropped from the bicubic-upscaled LQ
-            lq_tile = x_lq[:, ty:ty + tile_size, tx:tx + tile_size]
+            # LQ tile: sliced from globally-preprocessed LQ (degrade_lr_tile already applied)
+            lq_tile = x_lq_processed[:, ty:ty + tile_size, tx:tx + tile_size]
 
-            # Per-tile face mask (soft) – preproc / steering 양쪽에서 사용
+            # Per-tile face mask (soft) – steering 에서 사용
             face_tile_mask = None
             if soft_mask_global is not None:
                 face_tile_mask = _crop_pad_mask(soft_mask_global, ty, tx)
-                # tile 영역에 얼굴 픽셀이 거의 없으면 None 으로 빠른 패스
                 if not face_tile_mask.any():
                     face_tile_mask = None
 
-            # 픽셀 공간 LR degradation (원본 해상도 기준 dyn_sigma 사용 → blur 일관성)
-            if (enable_preproc and face_tile_mask is not None
-                    and dyn_sigma > 0):
-                # tile 외 영역은 zero-pad 됐을 수 있음 → 실제 LQ 영역 크기에 맞춰 crop
-                th_actual = lq_tile.shape[1]
-                tw_actual = lq_tile.shape[2]
-                m_for_deg = face_tile_mask[:th_actual, :tw_actual]
-                lq_tile = degrade_lr_tile(
-                    lq_tile_01=lq_tile,
-                    soft_mask=m_for_deg,
-                    sigma=dyn_sigma,
-                    noise_std=face_noise_std,
-                    degrad_blend_ratio=face_blend_ratio,
-                )
             lq_tiles.append(lq_tile)
             face_masks_per_tile.append(face_tile_mask)
 
@@ -507,12 +484,6 @@ def _infer_single_image(lq_path, ref_path, output_path,
             pred_acc[:,   ty:ty + tile_size, tx:tx + tile_size] += pred * w
             weight_acc[:, ty:ty + tile_size, tx:tx + tile_size] += w
 
-            if degrad_acc is not None:
-                w_cpu = tile_weight_map(tile_size, overlap, ty, tx, lq_h, lq_w)
-                dt    = lq_tiles[k].float().cpu().clamp(0, 1)
-                degrad_acc[:, ty:ty + tile_size, tx:tx + tile_size] += dt * w_cpu
-                degrad_wt[:,  ty:ty + tile_size, tx:tx + tile_size] += w_cpu
-
     # ── Merge tiles & save ────────────────────────────────────────────────────
     result     = (pred_acc / weight_acc.clamp(min=1e-6)).clamp(0, 1)
     result_img = transforms.ToPILImage()(result.cpu())
@@ -520,12 +491,6 @@ def _infer_single_image(lq_path, ref_path, output_path,
         result_img = wavelet_color_fix(result_img, lq_bicubic_img)
     result_img.resize((orig_w * scale, orig_h * scale), Image.BICUBIC).save(output_path)
     print(f"  Saved: {output_path}  ({orig_w * scale}x{orig_h * scale})")
-
-    # ── Degraded LR 저장 (multi-tile) ────────────────────────────────────────
-    if degrad_acc is not None:
-        degrad_merged = (degrad_acc / degrad_wt.clamp(min=1e-6)).clamp(0, 1)
-        transforms.ToPILImage()(degrad_merged).save(degrad_out)
-        print(f"  Saved degraded LR: {degrad_out}")
 
     # ── AICG 시각화 저장 ─────────────────────────────────────────────────────
     if viz is not None:
