@@ -51,6 +51,9 @@ def compute_dynamic_sigma(
 # Gaussian blur (separable, torch native)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_kernel_cache: dict = {}   # keyed by (sigma, kernel_size, device_str, dtype_str)
+
+
 def _gaussian_kernel_1d(
     sigma:       float,
     kernel_size: Optional[int] = None,
@@ -61,10 +64,18 @@ def _gaussian_kernel_1d(
         kernel_size = max(3, int(2 * round(3.0 * sigma) + 1))
     if kernel_size % 2 == 0:
         kernel_size += 1
+
+    cache_key = (float(sigma), kernel_size, str(device), str(dtype))
+    cached = _kernel_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     half = (kernel_size - 1) // 2
     x = torch.arange(-half, half + 1, device=device, dtype=dtype)
     k = torch.exp(-(x * x) / (2.0 * sigma * sigma))
-    return k / k.sum()
+    k = k / k.sum()
+    _kernel_cache[cache_key] = k
+    return k
 
 
 def gaussian_blur_2d(

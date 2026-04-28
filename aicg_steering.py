@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import math
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -275,10 +275,13 @@ class AICGSteerer:
         self._last_gate:  Optional[torch.Tensor] = None
 
         # active during apply_steering() context
-        self._active                  = False
-        self._original_processors:    list = []
-        self._steered_processors:     list = []
-        self._attn_ref_modules:       list = []
+        self._active                   = False
+        self._original_processors:     list = []
+        self._steered_processors_pool: list = []   # pre-created, reused across tile-batches
+        self._attn_ref_modules:        list = []
+
+        # query mask cache: keyed by L_q, invalidated on set_batch_face_masks()
+        self._query_mask_cache: Dict[int, Optional[torch.Tensor]] = {}
 
         self._collect_attn_ref_modules()
 
@@ -314,6 +317,11 @@ class AICGSteerer:
             m.attn_ref for m in cands
             if isinstance(m, BasicTransformerBlock) and hasattr(m, "attn_ref")
         ]
+        # Pre-create one processor per module; reused across all tile-batch calls
+        self._steered_processors_pool = [
+            SteeredReferenceAttnProcessor(self)
+            for _ in self._attn_ref_modules
+        ]
         if self.verbose:
             print(f"[AICGSteerer] attn_ref modules collected: "
                   f"{len(self._attn_ref_modules)}")
@@ -326,9 +334,11 @@ class AICGSteerer:
         값 범위: 0/1 권장 (soft mask 도 가능). 0.5 임계로 token-level bool 화.
         """
         self._batch_face_masks = list(masks)
+        self._query_mask_cache = {}   # new batch → invalidate cached downsampled masks
 
     def clear_batch_face_masks(self):
         self._batch_face_masks = None
+        self._query_mask_cache = {}
 
     def build_query_mask(
         self,
@@ -339,15 +349,27 @@ class AICGSteerer:
         """현재 batch face mask 들을 attention token 해상도(L_q) 로 다운샘플 → [B, L_q] bool.
 
         모든 tile 의 face mask 가 None 이면 None 반환 → no-op.
+        결과는 _query_mask_cache[L_q] 에 저장하여 같은 tile-batch 의 반복 호출을 O(1) 로 처리.
         """
         if not self._batch_face_masks:
             return None
         if all(m is None for m in self._batch_face_masks):
             return None
 
+        # cache hit: same tile-batch, same token resolution → reuse
+        if L_q in self._query_mask_cache:
+            cached = self._query_mask_cache[L_q]
+            if cached is None:
+                return None
+            if cached.device != device:
+                cached = cached.to(device=device)
+                self._query_mask_cache[L_q] = cached
+            return cached
+
         ls = int(math.sqrt(L_q))
         if ls * ls != L_q:
             # 비정사각 attention map (드물게 발생) → fallback: face mask 비활성
+            self._query_mask_cache[L_q] = None
             return None
 
         # B 가 face_mask 길이보다 클 수 있음(CFG 등). 부족분은 None 처리.
@@ -363,6 +385,8 @@ class AICGSteerer:
                     mode='area',
                 ).squeeze().reshape(-1)              # [L_q]
             out[i] = m_lr > 0.5
+
+        self._query_mask_cache[L_q] = out
         return out
 
     # ── processor swap context manager ──────────────────────────────────────
@@ -384,11 +408,8 @@ class AICGSteerer:
             return
 
         self._original_processors = []
-        self._steered_processors  = []
-        for ar in self._attn_ref_modules:
+        for ar, steered in zip(self._attn_ref_modules, self._steered_processors_pool):
             self._original_processors.append(ar.processor)
-            steered = SteeredReferenceAttnProcessor(self)
-            self._steered_processors.append(steered)
             ar.set_processor(steered)
 
         if self.verbose:
@@ -405,6 +426,5 @@ class AICGSteerer:
                 ar.set_processor(orig)
             self._active = False
             self._original_processors = []
-            self._steered_processors  = []
             if self.verbose:
                 print("[AICGSteerer] steering OFF (processors restored)")

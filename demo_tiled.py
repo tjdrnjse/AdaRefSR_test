@@ -432,7 +432,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
             if soft_mask_global is not None:
                 face_tile_mask = _crop_pad_mask(soft_mask_global, ty, tx)
                 # tile 영역에 얼굴 픽셀이 거의 없으면 None 으로 빠른 패스
-                if face_tile_mask.max().item() < 1e-3:
+                if not face_tile_mask.any():
                     face_tile_mask = None
 
             # 픽셀 공간 LR degradation (원본 해상도 기준 dyn_sigma 사용 → blur 일관성)
