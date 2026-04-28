@@ -6,9 +6,15 @@ VAE 인코더 통과 전 픽셀 공간에서 동작하는 전처리 유틸리티
 
 핵심 동작:
   1) Dynamic sigma   : 원본 해상도 face box 크기(max H,W)에 비례한 Gaussian sigma
+                       (현재 degrade_lr_tile 내부에서는 미사용; soft_mask 생성 용도로만 호출됨)
   2) Mask softening  : Hard box mask → Gaussian blur → Soft mask
-  3) LR degradation  : Soft mask 영역에 한해 동적 Blur + Monochrome 가우시안 노이즈
+  3) LR degradation  : Soft mask 영역에 한해 Pixelization (block downsample → bilinear up)
+                       + Monochrome 가우시안 노이즈
   4) Domain-shift 방어: blend_ratio 로 원본과 보간 + clamp(-1, 1) 로 VAE OOD 방지
+
+Pixelization (replaces previous Gaussian blur path):
+  얼굴 영역의 잘못된 ID 단서를 더 강하게 지우기 위해 Mosaic 형태로 다운/업샘플.
+  block_size=8 기본값.  area downsample → bilinear upsample.
 
 Monochrome noise:
   RGB 독립 노이즈는 chroma/색잡음을 만들어 ID 손상을 가속화함.
@@ -113,6 +119,42 @@ def gaussian_blur_2d(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Pixelization (mosaic) – area downsample then bilinear upsample
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pixelize_2d(
+    x:          torch.Tensor,   # [B, C, H, W] / [C, H, W] / [H, W]
+    block_size: int,
+) -> torch.Tensor:
+    """Mosaic-style pixelization.
+
+    H,W → (H/block, W/block) area pool → (H, W) bilinear upsample.
+    block_size <= 1 이면 입력 그대로 반환 (no-op).
+    입력 shape 그대로 반환.
+    """
+    if block_size is None or block_size <= 1:
+        return x
+
+    orig_ndim = x.ndim
+    if orig_ndim == 2:
+        x = x.unsqueeze(0).unsqueeze(0)
+    elif orig_ndim == 3:
+        x = x.unsqueeze(0)
+
+    B, C, H, W = x.shape
+    Hd = max(1, H // block_size)
+    Wd = max(1, W // block_size)
+    x_d = F.interpolate(x, size=(Hd, Wd), mode='area')
+    x_u = F.interpolate(x_d, size=(H, W), mode='bilinear', align_corners=False)
+
+    if orig_ndim == 2:
+        return x_u.squeeze(0).squeeze(0)
+    if orig_ndim == 3:
+        return x_u.squeeze(0)
+    return x_u
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Mask softening
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -166,13 +208,14 @@ def degrade_lr_tile(
     noise_std:         float,
     degrad_blend_ratio: float,
     clamp_range:       Tuple[float, float] = (-1.0, 1.0),
+    pixel_block_size:  int = 8,
 ) -> torch.Tensor:
-    """Soft mask 영역에 한해 LR 이미지에 동적 Blur + Monochrome 노이즈 주입.
+    """Soft mask 영역에 한해 LR 이미지에 Pixelization + Monochrome 노이즈 주입.
 
     수식 (VAE input 공간 [-1, 1]):
         x         = lq_tile_01 * 2 - 1
-        blurred   = GaussianBlur(x, sigma)
-        degraded  = blurred + monochrome_noise(std=noise_std)
+        pixelized = AreaDownsample(x, /block) → BilinearUpsample(., H,W)
+        degraded  = pixelized + monochrome_noise(std=noise_std)
         mixed     = blend * degraded + (1 - blend) * x          (도메인 시프트 방어)
         result    = soft_mask * mixed + (1 - soft_mask) * x     (얼굴 영역만 적용)
         result    = clamp(result, -1, 1)                        (VAE OOD 방지)
@@ -181,10 +224,12 @@ def degrade_lr_tile(
     Args:
         lq_tile_01         : LR 타일 [3, H, W], [0, 1] 범위
         soft_mask          : 같은 H,W 의 soft mask, [0, 1] 범위
-        sigma              : Gaussian blur sigma
+        sigma              : (Deprecated) Gaussian blur sigma — 현재 사용되지 않음.
+                              과거 시그니처 호환을 위해 남겨둠. soft_mask 생성용 sigma 와는 무관.
         noise_std          : monochrome 노이즈 std (in [-1,1] 공간)
         degrad_blend_ratio : 0 = no degradation, 1 = full degradation in mask
         clamp_range        : VAE OOD 방지용 clamp 범위 (default [-1, 1])
+        pixel_block_size   : Pixelization 블록 크기 (default 8). <=1 이면 pixelization 비활성.
 
     Returns:
         degraded LR tile [3, H, W] in [0, 1]
@@ -196,9 +241,9 @@ def degrade_lr_tile(
     dtype  = lq_tile_01.dtype
 
     x = lq_tile_01 * 2.0 - 1.0                                   # → [-1, 1]
-    blurred  = gaussian_blur_2d(x, sigma)
-    noise    = monochrome_gaussian_noise(blurred, noise_std)
-    degraded = blurred + noise
+    pixelized = pixelize_2d(x, pixel_block_size)
+    noise     = monochrome_gaussian_noise(pixelized, noise_std)
+    degraded  = pixelized + noise
 
     m = soft_mask.to(device=device, dtype=dtype).unsqueeze(0)    # [1, H, W]
 

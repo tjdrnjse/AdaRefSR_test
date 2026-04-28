@@ -113,13 +113,60 @@ face_noise_std:      0.08
 #                    0.4 ~ 0.7 권장.
 face_blend_ratio:    0.6
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 1 — Pixelization (Mosaic) for LR face degradation
+# ─────────────────────────────────────────────────────────────────────────────
+# face_preproc.degrade_lr_tile 의 내부 동작이 Gaussian blur 에서 Pixelization
+# (block-area downsample → bilinear upsample) 으로 대체됨.  잘못된 LR 얼굴
+# ID 단서를 더 강하게 지워 Ref ID 가 우세해지도록 유도.
+#
+# face_pixel_block_size : pixelization 블록 크기 (px).
+#   - 8 (default) : 약 8x8 블록 단위로 Mosaic.  중간 강도.
+#   - 16          : 더 강한 Mosaic (LR 디테일 거의 소실).
+#   - <=1         : Pixelization 비활성 (no-op).
+#   - enable_face_preproc=true 일 때만 적용됨.
+face_pixel_block_size: 8
+
 # ── Degraded LR 저장 옵션 ──────────────────────────────────────────────────
-# save_degraded_lr: true 로 설정하면 blur/noise 가 적용된 LR 이미지를 output_path
-#   와 같은 디렉터리에 <stem><suffix>.png 로 저장.
+# save_degraded_lr: true 로 설정하면 pixelization+noise 가 적용된 LR 이미지를
+#   output_path 와 같은 디렉터리에 <stem><suffix>.png 로 저장.
 #   - enable_face_preproc 가 true 일 때만 유효 (false 이면 원본 LQ와 동일하므로 저장 생략).
 # degraded_lr_suffix: 저장 파일명 접미사 (확장자 제외).
 save_degraded_lr:    false
 degraded_lr_suffix:  "_degrad_lr"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 2 — Full Ref Attention (single-pass global ref)
+# ─────────────────────────────────────────────────────────────────────────────
+# ref 를 1회만 (full_ref_size, full_ref_size) 로 resize 한 뒤 모든 LR tile 이
+# 동일한 ref bank 를 공유.  per-tile proportional ref crop 로직은 비활성됨.
+# 효과:
+#   - 모든 LR 위치가 ref 전체를 attention 으로 볼 수 있음 → 얼굴 ID 단서가
+#     멀리 떨어진 위치까지 전달됨.
+#   - net_ref forward 와 ref_reader.update 가 루프 밖에서 1회만 실행 → 속도 향상.
+#   - ref_tensor 는 reference_attention.py 내부에서 expand 로 batch 차원만 확장
+#     되어 메모리 추가 비용은 거의 없음.
+#
+# enable_full_ref : false 이면 기존 per-tile ref crop 동작 (수치적으로 원본 동일).
+# full_ref_size   : 글로벌 ref 의 H=W.  1024 가 기본값.  GPU VRAM 에 따라 조정.
+enable_full_ref:     false
+full_ref_size:       1024
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Change 3 — attn1 face token scaling (read mode self-attention weakening)
+# ─────────────────────────────────────────────────────────────────────────────
+# read 모드 BasicTransformerBlock 에서 self-attention(attn1) 출력을
+# hidden_states 에 더하기 직전, face_token_mask 가 있는 위치에서만 scale 곱.
+# 의도: LR 자기 self-attn 을 face 영역에서 약화시켜 Ref attention 의 영향이
+# 상대적으로 더 강해지도록 유도 (얼굴 ID 보존 보강).
+#
+# attn1_face_scale :
+#   - 1.0 (default) : 완전한 no-op (회귀 위험 0).
+#   - <1.0          : face 영역 attn1 약화 (예: 0.3, 0.5)
+#   - 0.0           : face 영역 attn1 완전 차단 (Ref 만 의존)
+#   - enable_steering 이 켜져 있고 ROI mask 가 주어졌을 때만 적용됨.
+#     (mask source 는 AICGSteerer.build_query_mask 결과를 공유)
+attn1_face_scale:    1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 사용 예시 (CLI)

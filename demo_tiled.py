@@ -156,7 +156,11 @@ def load_models(args, device, weight_dtype):
 
 def infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
                 x_src_b, x_ref_b, prompts_src, prompts_ref, weight_dtype):
-    """Run one batched SR forward pass. Returns raw model output [B,3,H,W] in [-1,1]."""
+    """Run one batched SR forward pass (Per-tile ref crop mode).
+
+    각 tile-batch 마다 net_ref 를 새 ref crop 으로 재실행 → ref_reader.update → net_sr → clear.
+    Returns raw model output [B,3,H,W] in [-1,1].
+    """
     with torch.no_grad():
         deg_scores  = net_de(x_src_b)
         net_ref(x_ref_b * 2.0 - 1.0, prompt=prompts_ref)
@@ -164,6 +168,30 @@ def infer_batch(net_sr, net_ref, net_de, ref_writer, ref_reader,
         predictions = net_sr(x_src_b * 2.0 - 1.0, deg_scores, prompt=prompts_src)
         ref_reader.clear()
         ref_writer.clear()
+    return predictions
+
+
+def infer_global_ref(net_ref, ref_writer, ref_reader, x_ref_g, prompt_ref, weight_dtype):
+    """[Full Ref Attention] net_ref 를 글로벌 ref 1장에 대해 1회만 실행, ref_reader 채움.
+
+    이후 모든 SR forward 는 같은 bank 를 공유한다.  호출자는 모든 SR forward 가 끝난 뒤
+    ref_writer.clear() / ref_reader.clear() 를 직접 호출해야 한다.
+
+    x_ref_g : [1, 3, H, W] ref tensor in [0, 1] (이미 device/dtype 로 옮겨진 상태)
+    """
+    with torch.no_grad():
+        net_ref(x_ref_g * 2.0 - 1.0, prompt=[prompt_ref])
+        ref_reader.update(ref_writer, dtype=weight_dtype)
+
+
+def infer_sr_only(net_sr, net_de, x_src_b, prompts_src, weight_dtype):
+    """[Full Ref Attention] SR forward 만 실행 (ref_reader 가 이미 채워져 있다고 가정).
+
+    Returns raw model output [B,3,H,W] in [-1,1].
+    """
+    with torch.no_grad():
+        deg_scores  = net_de(x_src_b)
+        predictions = net_sr(x_src_b * 2.0 - 1.0, deg_scores, prompt=prompts_src)
     return predictions
 
 
@@ -244,6 +272,8 @@ def _infer_single_image(lq_path, ref_path, output_path,
     aicg_trust_scale   = float(args.get("aicg_trust_scale",  1.0))
     aicg_verify_scale  = float(args.get("aicg_verify_scale", 1.0))
     aicg_force_verify  = bool(args.get("aicg_force_verify",  False))
+    # Change 3: read 모드 attn1 출력의 face token scale.  1.0 = no-op.
+    attn1_face_scale   = float(args.get("attn1_face_scale",  1.0))
 
     face_sigma_ratio   = float(args.get("face_sigma_ratio",  0.02))
     face_sigma_min     = float(args.get("face_sigma_min",    1.5))
@@ -251,6 +281,12 @@ def _infer_single_image(lq_path, ref_path, output_path,
     face_noise_std     = float(args.get("face_noise_std",    0.08))
     face_blend_ratio   = float(args.get("face_blend_ratio",  0.6))
     face_soft_mask_on  = bool(args.get("face_soft_mask",     True))
+    # Change 1: pixelization (mosaic) 블록 크기 (face_preproc.degrade_lr_tile)
+    face_pixel_block   = int(args.get("face_pixel_block_size", 8))
+
+    # Change 2: Full Ref Attention.  ref 를 1회 resize 후 모든 LR tile 이 공유
+    enable_full_ref    = bool(args.get("enable_full_ref",   False))
+    full_ref_size      = int(args.get("full_ref_size",      1024))
 
     save_degraded_lr   = bool(args.get("save_degraded_lr",   False))
     degraded_lr_suffix = str(args.get("degraded_lr_suffix",  "_degrad_lr"))
@@ -290,65 +326,98 @@ def _infer_single_image(lq_path, ref_path, output_path,
             trust_scale=aicg_trust_scale,
             verify_scale=aicg_verify_scale,
             force_verify=aicg_force_verify,
+            attn1_face_scale=attn1_face_scale,
             fusion_blocks=args.get("fusion_blocks", "full"),
         )
         print(f"  AICGSteerer: trust_eff={steerer.effective_trust_scale:.3f}, "
-              f"verify_eff={steerer.effective_verify_scale:.3f}")
+              f"verify_eff={steerer.effective_verify_scale:.3f}, "
+              f"attn1_face={attn1_face_scale:.3f}")
 
     # ── Global face preprocessing (전체 SR canvas 에서 1회만 수행) ──────────────
-    # 타일 경계 blur 아티팩트 방지 + 루프 내 CPU-GPU sync 제거
+    # 타일 경계 아티팩트 방지 + 루프 내 CPU-GPU sync 제거.
+    # Change 1: 내부 동작은 Pixelization (mosaic) + monochrome noise.
     x_lq_processed = x_lq
-    if enable_preproc and soft_mask_global is not None and dyn_sigma > 0:
+    if enable_preproc and soft_mask_global is not None and face_pixel_block > 1:
         x_lq_processed = degrade_lr_tile(
             lq_tile_01=x_lq,
             soft_mask=soft_mask_global,
-            sigma=dyn_sigma,
+            sigma=dyn_sigma,                       # vestigial; pixelization path 에서 미사용
             noise_std=face_noise_std,
             degrad_blend_ratio=face_blend_ratio,
+            pixel_block_size=face_pixel_block,
         )
         if save_degraded_lr:
             degrad_img = transforms.ToPILImage()(x_lq_processed.clamp(0, 1).cpu())
             degrad_img.save(degrad_out)
             print(f"  Saved degraded LR: {degrad_out}")
 
+    # ── Change 2: Global ref preparation (Full Ref Attention 모드 전용) ──────
+    # ref 를 1회만 (full_ref_size, full_ref_size) 로 resize 후 모든 LR tile 이 공유.
+    # ref_h_eff / ref_w_eff 는 visualizer 가 사용할 ref 공간 좌표.
+    x_ref_global: Optional[torch.Tensor] = None
+    if enable_full_ref:
+        x_ref_global = F.interpolate(
+            x_ref.unsqueeze(0),
+            size=(full_ref_size, full_ref_size),
+            mode='bicubic', align_corners=False,
+        ).squeeze(0).clamp(0, 1)                            # [3, full, full]
+        ref_h_eff, ref_w_eff = full_ref_size, full_ref_size
+        # viz 배경용 ref 이미지도 동일 해상도로 만들어 둠
+        ref_img_for_viz = transforms.ToPILImage()(x_ref_global.cpu())
+        print(f"  Full Ref Attention ON: ref resized {ref_h}x{ref_w} -> "
+              f"{full_ref_size}x{full_ref_size}, shared by all LR tiles")
+    else:
+        ref_h_eff, ref_w_eff = ref_h, ref_w
+        ref_img_for_viz = ref_img
+
     # ── Single-tile fast-path (upscaled LQ fits in one tile) ─────────────────
     if lq_h <= tile_size and lq_w <= tile_size:
         print("  SR canvas fits in one tile – running single inference.")
 
         x_src_t = x_lq_processed.unsqueeze(0).to(device, dtype=weight_dtype)
-        x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
 
         # 단일 타일에서도 steering 적용 (whole-image face mask 사용)
         if steerer is not None and soft_mask_global is not None:
             steerer.set_batch_face_masks([soft_mask_global])
 
-        def _run_infer():
-            return infer_batch(
-                net_sr, net_ref, net_de, ref_writer, ref_reader,
-                x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype,
+        if enable_full_ref:
+            # 글로벌 ref 1회 forward → ref_reader bank 채움 → SR forward 만 수행
+            x_ref_t = x_ref_global.unsqueeze(0).to(device, dtype=weight_dtype)
+            infer_global_ref(
+                net_ref, ref_writer, ref_reader,
+                x_ref_t, prompt_ref, weight_dtype,
             )
+            def _run_infer():
+                return infer_sr_only(
+                    net_sr, net_de, x_src_t, [prompt_src], weight_dtype,
+                )
+        else:
+            x_ref_t = x_ref.unsqueeze(0).to(device, dtype=weight_dtype)
+            def _run_infer():
+                return infer_batch(
+                    net_sr, net_ref, net_de, ref_writer, ref_reader,
+                    x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype,
+                )
 
         if visualize:
-            # [Fix 1] 폴더 경로·None 모두 파일 경로로 변환
             _vis_output = _resolve_vis_path(vis_output_path, output_path)
-            # steerer 가 있으면 probs/gate 캐싱 활성화 → viz 가 개입 결과를 반영
             if steerer is not None:
                 steerer.capture_for_viz = True
             viz = AICGVisualizer(
                 net_sr.unet, roi_mask=roi_mask,
-                ref_h=ref_h, ref_w=ref_w,
+                ref_h=ref_h_eff, ref_w=ref_w_eff,
                 lq_h=lq_h, lq_w=lq_w,
                 tile_size=tile_size,
                 fusion_blocks=args.get("fusion_blocks", "full"),
                 steerer=steerer,
             )
-            with viz.capture_tile(0, 0, 0, 0, ref_h, ref_w, lq_h, lq_w):
+            with viz.capture_tile(0, 0, 0, 0, ref_h_eff, ref_w_eff, lq_h, lq_w):
                 if steerer is not None:
                     with steerer.apply_steering():
                         preds = _run_infer()
                 else:
                     preds = _run_infer()
-            viz.finalize(np.array(ref_img), np.array(lq_bicubic_img), _vis_output)
+            viz.finalize(np.array(ref_img_for_viz), np.array(lq_bicubic_img), _vis_output)
         else:
             if steerer is not None:
                 with steerer.apply_steering():
@@ -358,6 +427,11 @@ def _infer_single_image(lq_path, ref_path, output_path,
 
         if steerer is not None:
             steerer.clear_batch_face_masks()
+
+        # full_ref 모드에서는 SR 끝난 뒤 글로벌 ref bank 정리
+        if enable_full_ref:
+            ref_writer.clear()
+            ref_reader.clear()
 
         pred_img = transforms.ToPILImage()((preds[0] * 0.5 + 0.5).clamp(0, 1).cpu())
         if args.get('align_method', 'wavelet') == 'wavelet':
@@ -381,18 +455,26 @@ def _infer_single_image(lq_path, ref_path, output_path,
     # ── 시각화 캔버스 초기화 ─────────────────────────────────────────────────
     viz = None
     if visualize:
-        # [Fix 1] 폴더 경로·None 모두 파일 경로로 변환
         _vis_output = _resolve_vis_path(vis_output_path, output_path)
-        # steerer 가 있으면 probs/gate 캐싱 활성화 → viz 가 개입 결과를 반영
         if steerer is not None:
             steerer.capture_for_viz = True
         viz = AICGVisualizer(
             net_sr.unet, roi_mask=roi_mask,
-            ref_h=ref_h, ref_w=ref_w,
+            ref_h=ref_h_eff, ref_w=ref_w_eff,
             lq_h=lq_h, lq_w=lq_w,
             tile_size=tile_size,
             fusion_blocks=args.get("fusion_blocks", "full"),
             steerer=steerer,
+        )
+
+    # ── Change 2: Full Ref Attention 모드일 때 ref 1회만 forward ─────────────
+    # ref_writer / ref_reader bank 가 모든 tile-batch 에서 공유됨.
+    # 루프 종료 후 단 1회만 clear() 해야 하므로 enable_full_ref 플래그를 보고 분기.
+    if enable_full_ref:
+        x_ref_g_t = x_ref_global.unsqueeze(0).to(device, dtype=weight_dtype)
+        infer_global_ref(
+            net_ref, ref_writer, ref_reader,
+            x_ref_g_t, prompt_ref, weight_dtype,
         )
 
     # ── Tile inference loop ───────────────────────────────────────────────────
@@ -429,25 +511,29 @@ def _infer_single_image(lq_path, ref_path, output_path,
             lq_tiles.append(lq_tile)
             face_masks_per_tile.append(face_tile_mask)
 
-            # Ref tile: proportionally cropped from the ORIGINAL ref (no upscaling).
-            ry  = int(ty  * ref_h / lq_h)
-            rx  = int(tx  * ref_w / lq_w)
-            rth = max(1, round(tile_size * ref_h / lq_h))
-            rtw = max(1, round(tile_size * ref_w / lq_w))
-            ry  = min(ry, max(0, ref_h - rth))
-            rx  = min(rx, max(0, ref_w - rtw))
-            ref_crop = x_ref[:, ry : ry + rth, rx : rx + rtw]
-            if rth != tile_size or rtw != tile_size:
-                ref_crop = F.interpolate(
-                    ref_crop.unsqueeze(0),
-                    size=(tile_size, tile_size),
-                    mode='bicubic', align_corners=False,
-                ).squeeze(0)
-            ref_tiles.append(ref_crop)
-            tile_coords.append((ty, tx, ry, rx, rth, rtw))
+            if enable_full_ref:
+                # Change 2: 모든 tile 이 같은 글로벌 ref 를 참조 → per-tile crop 생략.
+                # tile_coords 는 viz 가 사용하므로 ref 전체 영역으로 채워둠.
+                tile_coords.append((ty, tx, 0, 0, ref_h_eff, ref_w_eff))
+            else:
+                # Per-tile ref proportional crop (legacy path).
+                ry  = int(ty  * ref_h / lq_h)
+                rx  = int(tx  * ref_w / lq_w)
+                rth = max(1, round(tile_size * ref_h / lq_h))
+                rtw = max(1, round(tile_size * ref_w / lq_w))
+                ry  = min(ry, max(0, ref_h - rth))
+                rx  = min(rx, max(0, ref_w - rtw))
+                ref_crop = x_ref[:, ry : ry + rth, rx : rx + rtw]
+                if rth != tile_size or rtw != tile_size:
+                    ref_crop = F.interpolate(
+                        ref_crop.unsqueeze(0),
+                        size=(tile_size, tile_size),
+                        mode='bicubic', align_corners=False,
+                    ).squeeze(0)
+                ref_tiles.append(ref_crop)
+                tile_coords.append((ty, tx, ry, rx, rth, rtw))
 
         x_src_b = torch.stack(lq_tiles).to(device, dtype=weight_dtype)
-        x_ref_b = torch.stack(ref_tiles).to(device, dtype=weight_dtype)
 
         prompts_ref_b = [prompt_ref] * B
         prompts_src_b = [prompt_src] * B
@@ -456,11 +542,19 @@ def _infer_single_image(lq_path, ref_path, output_path,
         if steerer is not None:
             steerer.set_batch_face_masks(face_masks_per_tile)
 
-        def _run_batch():
-            return infer_batch(
-                net_sr, net_ref, net_de, ref_writer, ref_reader,
-                x_src_b, x_ref_b, prompts_src_b, prompts_ref_b, weight_dtype,
-            )
+        if enable_full_ref:
+            # 글로벌 ref bank 가 이미 채워져 있으므로 SR forward 만 실행
+            def _run_batch():
+                return infer_sr_only(
+                    net_sr, net_de, x_src_b, prompts_src_b, weight_dtype,
+                )
+        else:
+            x_ref_b = torch.stack(ref_tiles).to(device, dtype=weight_dtype)
+            def _run_batch():
+                return infer_batch(
+                    net_sr, net_ref, net_de, ref_writer, ref_reader,
+                    x_src_b, x_ref_b, prompts_src_b, prompts_ref_b, weight_dtype,
+                )
 
         # viz / steering 이중 컨텍스트
         if viz is not None and steerer is not None:
@@ -484,6 +578,11 @@ def _infer_single_image(lq_path, ref_path, output_path,
             pred_acc[:,   ty:ty + tile_size, tx:tx + tile_size] += pred * w
             weight_acc[:, ty:ty + tile_size, tx:tx + tile_size] += w
 
+    # ── Change 2: 모든 tile-batch SR 종료 후 글로벌 ref bank 1회만 clear ─────
+    if enable_full_ref:
+        ref_writer.clear()
+        ref_reader.clear()
+
     # ── Merge tiles & save ────────────────────────────────────────────────────
     result     = (pred_acc / weight_acc.clamp(min=1e-6)).clamp(0, 1)
     result_img = transforms.ToPILImage()(result.cpu())
@@ -494,7 +593,7 @@ def _infer_single_image(lq_path, ref_path, output_path,
 
     # ── AICG 시각화 저장 ─────────────────────────────────────────────────────
     if viz is not None:
-        viz.finalize(np.array(ref_img), np.array(lq_bicubic_img), _vis_output)
+        viz.finalize(np.array(ref_img_for_viz), np.array(lq_bicubic_img), _vis_output)
 
 
 def run_demo_tiled(lq_path, ref_path, output_path, args):
@@ -676,6 +775,24 @@ if __name__ == "__main__":
                              help="blur/noise 가 적용된 LR 이미지를 output_path 옆에 저장.")
     demo_parser.add_argument("--degraded_lr_suffix",  type=str, default=None,
                              help="Degraded LR 파일명 접미사 (default '_degrad_lr').")
+
+    # ── Change 1: Pixelization 블록 크기 ─────────────────────────────────────
+    demo_parser.add_argument("--face_pixel_block_size", type=int, default=None,
+                             help="얼굴 영역 pixelization 블록 크기 (default 8). "
+                                  "Mosaic 강도 = block 크기.  <=1 이면 pixelization 비활성.")
+
+    # ── Change 2: Full Ref Attention ────────────────────────────────────────
+    demo_parser.add_argument("--enable_full_ref",     action="store_true", default=None,
+                             help="ref 를 1회만 (full_ref_size, full_ref_size) 로 resize 후 "
+                                  "모든 LR tile 이 같은 ref bank 를 공유 (per-tile crop 비활성).")
+    demo_parser.add_argument("--full_ref_size",       type=int,   default=None,
+                             help="Full Ref Attention 시 ref 의 H=W (default 1024).")
+
+    # ── Change 3: attn1 face scale ──────────────────────────────────────────
+    demo_parser.add_argument("--attn1_face_scale",    type=float, default=None,
+                             help="read 모드 self-attn(attn1) 출력의 face token scale "
+                                  "(default 1.0 = no-op).  <1.0 이면 LR self-attn 약화 → "
+                                  "Ref 영향 상대적으로 강화.  enable_steering 필요.")
 
     demo_args, unknown = demo_parser.parse_known_args()
 

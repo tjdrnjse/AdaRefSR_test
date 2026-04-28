@@ -246,21 +246,25 @@ class AICGSteerer:
     def __init__(
         self,
         unet,
-        scale:         float = 1.0,
-        trust_scale:   float = 1.0,
-        verify_scale:  float = 1.0,
-        force_verify:  bool  = False,
-        fusion_blocks: str   = "full",
-        verbose:       bool  = False,
+        scale:             float = 1.0,
+        trust_scale:       float = 1.0,
+        verify_scale:      float = 1.0,
+        force_verify:      bool  = False,
+        attn1_face_scale:  float = 1.0,
+        fusion_blocks:     str   = "full",
+        verbose:           bool  = False,
     ):
-        self.unet          = unet
-        self.scale         = float(scale)
-        self.trust_scale   = float(trust_scale)
-        self.verify_scale  = float(verify_scale)
+        self.unet              = unet
+        self.scale             = float(scale)
+        self.trust_scale       = float(trust_scale)
+        self.verify_scale      = float(verify_scale)
         # force_verify=True: face_mask 영역 gate 를 verify_scale 무관하게 무조건 1.0 으로 강제
-        self.force_verify  = bool(force_verify)
-        self.fusion_blocks = fusion_blocks
-        self.verbose       = verbose
+        self.force_verify      = bool(force_verify)
+        # attn1_face_scale: read 모드 self-attn (attn1) 결과를 face token 위치에서만 곱하는 스케일.
+        # 1.0 = no-op (회귀 위험 0).  < 1.0 = LR 자기 self-attn 약화 → Ref 영향 상대적으로 강화.
+        self.attn1_face_scale  = float(attn1_face_scale)
+        self.fusion_blocks     = fusion_blocks
+        self.verbose           = verbose
 
         # per-batch (re-set every tile-batch)
         self._batch_face_masks: Optional[List[Optional[torch.Tensor]]] = None
@@ -279,6 +283,8 @@ class AICGSteerer:
         self._original_processors:     list = []
         self._steered_processors_pool: list = []   # pre-created, reused across tile-batches
         self._attn_ref_modules:        list = []
+        # BasicTransformerBlock 들 — apply_steering 에서 face mask 공유용으로 사용
+        self._basic_blocks:            list = []
 
         # query mask cache: keyed by L_q, invalidated on set_batch_face_masks()
         self._query_mask_cache: Dict[int, Optional[torch.Tensor]] = {}
@@ -317,6 +323,11 @@ class AICGSteerer:
             m.attn_ref for m in cands
             if isinstance(m, BasicTransformerBlock) and hasattr(m, "attn_ref")
         ]
+        # 같은 BasicTransformerBlock 들을 따로 보관: apply_steering 에서
+        # face mask provider / attn1_face_scale 등록·해제용.
+        self._basic_blocks = [
+            m for m in cands if isinstance(m, BasicTransformerBlock)
+        ]
         # Pre-create one processor per module; reused across all tile-batch calls
         self._steered_processors_pool = [
             SteeredReferenceAttnProcessor(self)
@@ -324,7 +335,8 @@ class AICGSteerer:
         ]
         if self.verbose:
             print(f"[AICGSteerer] attn_ref modules collected: "
-                  f"{len(self._attn_ref_modules)}")
+                  f"{len(self._attn_ref_modules)},  "
+                  f"basic_blocks: {len(self._basic_blocks)}")
 
     # ── per-batch face mask interface ───────────────────────────────────────
 
@@ -412,11 +424,19 @@ class AICGSteerer:
             self._original_processors.append(ar.processor)
             ar.set_processor(steered)
 
+        # Change 3: BasicTransformerBlock 에 face mask provider 와 attn1 face scale 을 부착.
+        # reference_attention.py 의 read 모드 inner_forward 가 이 두 attribute 를 조회해
+        # face token 위치에서만 attn1 출력을 스케일한다.  scale=1.0 이면 no-op.
+        for blk in self._basic_blocks:
+            blk._face_mask_steerer = self
+            blk._face_attn1_scale  = self.attn1_face_scale
+
         if self.verbose:
             print(f"[AICGSteerer] steering ON  "
                   f"(scale={self.scale}, trust={self.trust_scale}, verify={self.verify_scale}, "
                   f"effective_trust={self.effective_trust_scale}, "
-                  f"effective_verify={self.effective_verify_scale})")
+                  f"effective_verify={self.effective_verify_scale}, "
+                  f"attn1_face_scale={self.attn1_face_scale})")
 
         self._active = True
         try:
@@ -424,6 +444,10 @@ class AICGSteerer:
         finally:
             for ar, orig in zip(self._attn_ref_modules, self._original_processors):
                 ar.set_processor(orig)
+            # Change 3: face mask provider 정리 (no-op 상태로 복귀)
+            for blk in self._basic_blocks:
+                blk._face_mask_steerer = None
+                blk._face_attn1_scale  = 1.0
             self._active = False
             self._original_processors = []
             if self.verbose:
