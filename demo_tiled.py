@@ -286,6 +286,9 @@ def _infer_single_image(lq_path, ref_path, output_path,
 
     # Change 2: Full Ref Attention.  ref 를 1회 resize 후 모든 LR tile 이 공유
     enable_full_ref    = bool(args.get("enable_full_ref",   False))
+
+    # Change 4: Face tile ref crop expansion ratio (token-length extension)
+    face_ref_expand_ratio = float(args.get("face_ref_expand_ratio", 1.0))
     full_ref_size      = int(args.get("full_ref_size",      1024))
 
     save_degraded_lr   = bool(args.get("save_degraded_lr",   False))
@@ -487,10 +490,51 @@ def _infer_single_image(lq_path, ref_path, output_path,
         padded[:crop.shape[0], :crop.shape[1]] = crop
         return padded
 
-    for batch_start in range(0, n_tiles, batch_sz):
-        batch_pos = all_tiles[batch_start : batch_start + batch_sz]
+    # ── Change 4: face / normal tile split for expanded ref crop ─────────────
+    # face_ref_expand_ratio > 1.0: face tile 의 ref crop 을 expand 배 넓게 잘라
+    # net_ref 에 resize 없이 통과 → bank 에 더 많은 토큰 → 오정렬 얼굴도 attend.
+    # enable_full_ref 와 병용 불가 (모든 tile 이 동일 글로벌 ref bank 를 공유하므로).
+    use_face_expand = (
+        face_ref_expand_ratio > 1.0
+        and not enable_full_ref
+        and soft_mask_global is not None
+    )
+
+    if use_face_expand:
+        rth_base = max(1, round(tile_size * ref_h / lq_h))
+        rtw_base = max(1, round(tile_size * ref_w / lq_w))
+        # VAE(÷8) + UNet 다운샘플(÷8) = ÷64 → 64 배수 정렬
+        rth_face = max(64, round(rth_base * face_ref_expand_ratio) // 64 * 64)
+        rtw_face = max(64, round(rtw_base * face_ref_expand_ratio) // 64 * 64)
+        rth_face = min(rth_face, ref_h)
+        rtw_face = min(rtw_face, ref_w)
+
+        normal_tiles:   list = []
+        face_tiles_pos: list = []
+        for (ty, tx) in all_tiles:
+            if _crop_pad_mask(soft_mask_global, ty, tx).any():
+                face_tiles_pos.append((ty, tx))
+            else:
+                normal_tiles.append((ty, tx))
+
+        print(f"  Face Ref Expand: {face_ref_expand_ratio}x → "
+              f"face ref tile {rth_face}×{rtw_face}px (base {rth_base}×{rtw_base}px), "
+              f"normal={len(normal_tiles)}, face={len(face_tiles_pos)} tiles")
+    else:
+        normal_tiles   = all_tiles
+        face_tiles_pos = []
+        rth_face = rtw_face = 0
+
+    def _make_batches(positions, label):
+        return [(label, positions[i : i + batch_sz])
+                for i in range(0, len(positions), batch_sz)]
+
+    all_batches   = _make_batches(normal_tiles, 'normal') + _make_batches(face_tiles_pos, 'face')
+    total_batches = len(all_batches)
+
+    for batch_idx, (tile_type, batch_pos) in enumerate(all_batches):
         B = len(batch_pos)
-        print(f"    tiles {batch_start + 1}-{batch_start + B} / {n_tiles}")
+        print(f"    batch {batch_idx + 1}/{total_batches} [{tile_type}]  ({B} tiles)")
 
         lq_tiles    = []
         ref_tiles   = []
@@ -515,6 +559,16 @@ def _infer_single_image(lq_path, ref_path, output_path,
                 # Change 2: 모든 tile 이 같은 글로벌 ref 를 참조 → per-tile crop 생략.
                 # tile_coords 는 viz 가 사용하므로 ref 전체 영역으로 채워둠.
                 tile_coords.append((ty, tx, 0, 0, ref_h_eff, ref_w_eff))
+            elif tile_type == 'face':
+                # Change 4: center-anchored expanded ref crop (no resize).
+                # ref 픽셀 공간에서 tile 중심 기준으로 rth_face×rtw_face 만큼 넓게 자름.
+                ry_c = int(round((ty + tile_size / 2) * ref_h / lq_h))
+                rx_c = int(round((tx + tile_size / 2) * ref_w / lq_w))
+                ry_f = max(0, min(ry_c - rth_face // 2, ref_h - rth_face))
+                rx_f = max(0, min(rx_c - rtw_face // 2, ref_w - rtw_face))
+                ref_crop = x_ref[:, ry_f : ry_f + rth_face, rx_f : rx_f + rtw_face]
+                ref_tiles.append(ref_crop)
+                tile_coords.append((ty, tx, ry_f, rx_f, rth_face, rtw_face))
             else:
                 # Per-tile ref proportional crop (legacy path).
                 ry  = int(ty  * ref_h / lq_h)
@@ -787,6 +841,13 @@ if __name__ == "__main__":
                                   "모든 LR tile 이 같은 ref bank 를 공유 (per-tile crop 비활성).")
     demo_parser.add_argument("--full_ref_size",       type=int,   default=None,
                              help="Full Ref Attention 시 ref 의 H=W (default 1024).")
+
+    # ── Change 4: Face tile expanded ref crop ───────────────────────────────
+    demo_parser.add_argument("--face_ref_expand_ratio", type=float, default=None,
+                             help="Face tile 의 ref crop 확장 배율 (default 1.0 = 비활성). "
+                                  "2.0 이면 ref crop 이 가로/세로 2배 넓어져 net_ref 에 "
+                                  "직접 통과 → 더 많은 attention token. "
+                                  "enable_full_ref 와 병용 불가.")
 
     # ── Change 3: attn1 face scale ──────────────────────────────────────────
     demo_parser.add_argument("--attn1_face_scale",    type=float, default=None,
