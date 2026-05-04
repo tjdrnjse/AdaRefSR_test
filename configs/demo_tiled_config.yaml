@@ -188,6 +188,30 @@ attn1_face_scale:    1.0
 face_ref_expand_ratio: 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
+# XFeat Feature Matching Tiling (Dynamic Ref Tile Selection)
+# ─────────────────────────────────────────────────────────────────────────────
+# use_feature_matching_tiling: true 이면 XFeat 특징점 매칭으로 ref 타일을 동적
+#   선택 (Strategy 1, Median-based Crop).  false(기본) = 기존 비례 크롭 유지.
+#
+# Pipeline:
+#   1. Scale Sync    : ref 를 lr 해상도로 임시 resize
+#   2. XFeat Match   : sparse 특징점 매칭
+#   3. RANSAC        : cv2.findHomography 인라이어 필터링 (USAC_MAGSAC)
+#   4. Re-project    : ref 특징점을 원본 ref 해상도로 역산
+#   5. Tile Filter   : lr 타일 내 특징점 검색
+#   6. Median Crop   : median(ref pts) 중심의 고정 크기 BBox 크롭
+#   7. Fallback      : lr 타일에 특징점 없으면 기존 비례 크롭으로 폴백
+#
+# xfeat_project_path: accelerated_features 폴더 경로.
+#   런타임에 sys.path.insert 로 동적 로드됨.
+#   예) "../accelerated_features" 또는 절대 경로
+#
+# 주의: enable_full_ref=true 와 병용 시 feature matching 은 자동 비활성됨
+#       (full_ref 모드에서는 per-tile ref crop 자체가 없음).
+use_feature_matching_tiling: false
+xfeat_project_path: null    # 예) "../accelerated_features"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 사용 예시 (CLI)
 # ─────────────────────────────────────────────────────────────────────────────
 #

@@ -199,7 +199,8 @@ def _infer_single_image(lq_path, ref_path, output_path,
                         net_sr, net_ref, net_de, model_vlm, model_vlm_deg,
                         ref_writer, ref_reader, args, device, weight_dtype,
                         tile_size, overlap, batch_sz, scale,
-                        visualize=False, roi_path=None, vis_output_path=None):
+                        visualize=False, roi_path=None, vis_output_path=None,
+                        fmt=None):
     """Process a single (lq, ref) image pair and save the result.
 
     LQ is bicubic-upscaled by `scale` before tiling so the network output
@@ -448,6 +449,12 @@ def _infer_single_image(lq_path, ref_path, output_path,
     xs = tile_start_coords(lq_w, tile_size, overlap)
     all_tiles = [(y, x) for y in ys for x in xs]
     n_tiles    = len(all_tiles)
+
+    # ── Feature matching preparation (once per image, before any batch) ──────
+    if fmt is not None:
+        fmt_ready = fmt.prepare(x_lq, x_ref)
+        if not fmt_ready:
+            print("  [FMT] Feature matching failed – proportional fallback for all tiles.")
     print(f"  Grid: {lq_h}x{lq_w} -> {len(ys)}x{len(xs)} = {n_tiles} tiles "
           f"(tile={tile_size}, overlap={overlap}, batch={batch_sz})")
 
@@ -541,7 +548,14 @@ def _infer_single_image(lq_path, ref_path, output_path,
         tile_coords = []   # (ty, tx, ry, rx, rth, rtw) per tile in batch
         face_masks_per_tile: list = []
 
-        for (ty, tx) in batch_pos:
+        # Pre-compute feature-matching ref crops for normal batches (batched resize)
+        _fm_crops = _fm_coords = None
+        if tile_type == 'normal' and not enable_full_ref and fmt is not None and fmt._ready:
+            _fm_crops, _fm_coords = fmt.get_ref_crops_batch(
+                batch_pos, tile_size, x_ref, tile_size, lq_h, lq_w,
+            )
+
+        for i_tile, (ty, tx) in enumerate(batch_pos):
             # LQ tile: sliced from globally-preprocessed LQ (degrade_lr_tile already applied)
             lq_tile = x_lq_processed[:, ty:ty + tile_size, tx:tx + tile_size]
 
@@ -569,6 +583,11 @@ def _infer_single_image(lq_path, ref_path, output_path,
                 ref_crop = x_ref[:, ry_f : ry_f + rth_face, rx_f : rx_f + rtw_face]
                 ref_tiles.append(ref_crop)
                 tile_coords.append((ty, tx, ry_f, rx_f, rth_face, rtw_face))
+            elif _fm_crops is not None:
+                # Feature-matching ref crop (Strategy 1, Median-based BBox).
+                ref_tiles.append(_fm_crops[i_tile])
+                ry, rx, rth, rtw = _fm_coords[i_tile]
+                tile_coords.append((ty, tx, ry, rx, rth, rtw))
             else:
                 # Per-tile ref proportional crop (legacy path).
                 ry  = int(ty  * ref_h / lq_h)
@@ -762,6 +781,18 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
         load_models(args, device, weight_dtype)
     print(">>> Models loaded.")
 
+    # ── FeatureMatchingTiler (XFeat) 로드 ────────────────────────────────────
+    fmt = None
+    if bool(args.get("use_feature_matching_tiling", False)):
+        xfeat_path = str(args.get("xfeat_project_path", "") or "")
+        if xfeat_path and os.path.isdir(xfeat_path):
+            from my_utils.feature_matching_tiling import FeatureMatchingTiler
+            fmt = FeatureMatchingTiler(xfeat_path)
+            print(f">>> FeatureMatchingTiler: XFeat loaded from {xfeat_path}")
+        else:
+            print(f"[WARNING] use_feature_matching_tiling=true but "
+                  f"xfeat_project_path not found: '{xfeat_path}'")
+
     # ── 이미지 쌍 순차 처리 ──────────────────────────────────────────────────
     n_total = len(image_pairs)
     for idx, (lq_f, ref_f, out_f, roi_f) in enumerate(image_pairs, 1):
@@ -772,6 +803,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
             ref_writer, ref_reader,
             args, device, weight_dtype, tile_size, overlap, batch_sz, scale,
             visualize=visualize, roi_path=roi_f, vis_output_path=vis_out,
+            fmt=fmt,
         )
 
     print(f"\n>>> All done. {n_total} image(s) processed.")
@@ -854,6 +886,14 @@ if __name__ == "__main__":
                              help="read 모드 self-attn(attn1) 출력의 face token scale "
                                   "(default 1.0 = no-op).  <1.0 이면 LR self-attn 약화 → "
                                   "Ref 영향 상대적으로 강화.  enable_steering 필요.")
+
+    # ── XFeat Feature Matching Tiling ────────────────────────────────────────
+    demo_parser.add_argument("--use_feature_matching_tiling", action="store_true", default=None,
+                             help="XFeat 특징점 매칭으로 ref 타일을 동적 선택. "
+                                  "xfeat_project_path 도 함께 지정해야 함.")
+    demo_parser.add_argument("--xfeat_project_path", type=str, default=None,
+                             help="accelerated_features 폴더의 절대/상대 경로. "
+                                  "런타임에 sys.path 에 동적 추가됨.")
 
     demo_args, unknown = demo_parser.parse_known_args()
 
