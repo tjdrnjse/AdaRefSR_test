@@ -451,9 +451,13 @@ def _infer_single_image(lq_path, ref_path, output_path,
     n_tiles    = len(all_tiles)
 
     # ── Feature matching preparation (once per image, before any batch) ──────
+    # x_lq_orig (원본 해상도) 로 매칭 → 더 선명한 특징점 추출.
+    # 매칭 후 LR 키포인트 좌표를 scale 배 스케일링하여 4x canvas 좌표계로 변환.
     if fmt is not None:
-        fmt_ready = fmt.prepare(x_lq, x_ref)
-        if not fmt_ready:
+        fmt_ready = fmt.prepare(x_lq_orig, x_ref)
+        if fmt_ready:
+            fmt._mkpts_lr *= scale   # 원본 LR → 4x canvas 좌표계로 변환
+        else:
             print("  [FMT] Feature matching failed – proportional fallback for all tiles.")
     print(f"  Grid: {lq_h}x{lq_w} -> {len(ys)}x{len(xs)} = {n_tiles} tiles "
           f"(tile={tile_size}, overlap={overlap}, batch={batch_sz})")
