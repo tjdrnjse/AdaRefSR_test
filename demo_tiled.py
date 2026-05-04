@@ -706,14 +706,15 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
         skipped = []
         roi_missing = []
         for fname in lq_files:
-            ref_file = os.path.join(ref_path, fname)
-            if not os.path.exists(ref_file):
+            stem     = os.path.splitext(fname)[0]
+            # ref: 스템 기반 매칭 (확장자 달라도 스템 같으면 매칭됨)
+            ref_file = find_roi_by_stem(ref_path, stem)
+            if ref_file is None:
                 skipped.append(fname)
                 continue
             # roi_path 가 폴더면 스템(확장자 제외 파일명)으로 매칭.
             # lq 가 .jpeg 이고 roi 가 .png 여도 스템이 같으면 매칭됨.
             if roi_is_dir:
-                stem     = os.path.splitext(fname)[0]
                 roi_file = find_roi_by_stem(roi_path, stem)
                 if roi_file is None:
                     roi_missing.append(fname)
