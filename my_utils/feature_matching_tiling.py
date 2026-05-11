@@ -234,6 +234,8 @@ class FeatureMatchingTiler:
         sy = lr_h / ref_h
 
         # Keypoints + ref crop boxes on ref display panel
+        # Also store ref crop center per tile for the tile-center arrows
+        tile_ref_box_center: dict = {}
         for (ty, tx), idxs in tile_to_idx.items():
             color = tile_color[(ty, tx)]
             ref_pts = mkpts_ref[idxs]
@@ -244,23 +246,24 @@ class FeatureMatchingTiler:
                 cv2.circle(ref_bgr, (rx, ry), 3, color, -1)
                 cv2.circle(ref_bgr, (rx, ry), 4, (255, 255, 255), 1)
 
-            # Draw the ref crop box (tile_size_4x × tile_size_4x in orig ref space)
+            # Ref crop box (tile_size_4x × tile_size_4x in orig ref space)
             x0, y0, x1, y1 = self._bbox_from_median(ref_pts, ref_h, ref_w, tile_size_4x)
             bx0, by0 = int(x0 * sx), int(y0 * sy)
             bx1, by1 = int(x1 * sx), int(y1 * sy)
             cv2.rectangle(ref_bgr, (bx0, by0), (bx1, by1), color, 2)
+            tile_ref_box_center[(ty, tx)] = ((bx0 + bx1) // 2, (by0 + by1) // 2)
 
         # Combine panels side by side
         combined = np.hstack([lr_bgr, ref_bgr])
 
-        # Connecting lines between matched LQ ↔ Ref keypoints (max 10 per tile)
-        _MAX_LINES = 10
-        for (ty, tx), idxs in tile_to_idx.items():
-            color = tile_color[(ty, tx)]
-            for i in idxs[:_MAX_LINES]:
-                p1 = (int(mkpts_lr[i, 0]),  int(mkpts_lr[i, 1]))
-                p2 = (int(mkpts_ref[i, 0] * sx) + lr_w, int(mkpts_ref[i, 1] * sy))
-                cv2.line(combined, p1, p2, color, 1, cv2.LINE_AA)
+        # One arrow per tile: LQ tile center → Ref crop box center
+        for (ty, tx), color in tile_color.items():
+            lq_cx = min(tx + ts // 2, lr_w - 1)
+            lq_cy = min(ty + ts // 2, lr_h - 1)
+            ref_cx, ref_cy = tile_ref_box_center[(ty, tx)]
+            p1 = (lq_cx, lq_cy)
+            p2 = (ref_cx + lr_w, ref_cy)
+            cv2.arrowedLine(combined, p1, p2, color, 2, cv2.LINE_AA, tipLength=0.02)
 
         # Label bar
         bar_h = 24
