@@ -818,7 +818,12 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
         xfeat_path = str(args.get("xfeat_project_path", "") or "")
         if xfeat_path and os.path.isdir(xfeat_path):
             from my_utils.feature_matching_tiling import FeatureMatchingTiler
-            fmt = FeatureMatchingTiler(xfeat_path)
+            fmt = FeatureMatchingTiler(
+                xfeat_path,
+                ransac_threshold=float(args.get("fmt_ransac_threshold", 3.5)),
+                min_inliers=int(args.get("fmt_min_inliers", 4)),
+                match_at_ref_resolution=bool(args.get("fmt_match_at_ref_resolution", False)),
+            )
             print(f">>> FeatureMatchingTiler: XFeat loaded from {xfeat_path}")
         else:
             print(f"[WARNING] use_feature_matching_tiling=true but "

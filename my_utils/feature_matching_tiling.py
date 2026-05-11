@@ -29,15 +29,30 @@ from typing import List, Optional, Tuple
 class FeatureMatchingTiler:
     """XFeat-based ref tile selector for AdaRefSR tiled inference."""
 
-    def __init__(self, xfeat_project_path: str):
+    def __init__(
+        self,
+        xfeat_project_path: str,
+        ransac_threshold: float = 3.5,
+        min_inliers: int = 4,
+        match_at_ref_resolution: bool = False,
+    ):
         """
-        xfeat_project_path: absolute path to the accelerated_features folder.
-        XFeat is dynamically imported and uses CUDA when available.
+        xfeat_project_path    : absolute path to the accelerated_features folder.
+        ransac_threshold      : RANSAC reprojection error threshold (pixels).
+                                Increase (5~8) to tolerate rotation / slight misalignment.
+        min_inliers           : minimum post-RANSAC inliers to accept the match.
+        match_at_ref_resolution: True  → upsample LQ to ref resolution before matching
+                                         (preserves ref feature quality; slower).
+                                 False → downsample ref to LQ resolution (original).
         """
         if xfeat_project_path not in sys.path:
             sys.path.insert(0, xfeat_project_path)
         from modules.xfeat import XFeat
         self.xfeat = XFeat()
+
+        self._ransac_threshold    = ransac_threshold
+        self._min_inliers         = min_inliers
+        self._match_at_ref_res    = match_at_ref_resolution
 
         self._ready = False
         self._mkpts_lr: Optional[np.ndarray] = None   # (N,2) x,y in LR canvas space
@@ -301,11 +316,11 @@ class FeatureMatchingTiler:
         """
         Run the full matching pipeline once per (lr, ref) image pair.
 
-        lr  : [3, H,  W ] in [0,1] — upscaled LQ canvas (CPU tensor)
-        ref : [3, Hr, Wr] in [0,1] — original ref image  (CPU tensor)
+        lr  : [3, H,  W ] in [0,1] — original LQ image (CPU tensor)
+        ref : [3, Hr, Wr] in [0,1] — original ref image (CPU tensor)
 
-        Returns True when >= 4 RANSAC inlier matches are found.
-        Results are stored internally for subsequent get_ref_crops_batch() calls.
+        Returns True when >= min_inliers RANSAC inlier matches are found.
+        Results stored in _mkpts_lr (orig LQ coords) and _mkpts_ref (orig ref coords).
         """
         self._ready = False
         self._mkpts_lr = None
@@ -314,45 +329,67 @@ class FeatureMatchingTiler:
         lr_h, lr_w   = lr.shape[1],  lr.shape[2]
         ref_h, ref_w = ref.shape[1], ref.shape[2]
 
-        # 1. Scale Sync: resize ref to lr resolution
-        ref_scaled = F.interpolate(
-            ref.unsqueeze(0).float(), size=(lr_h, lr_w),
-            mode='bicubic', align_corners=False,
-        ).squeeze(0).clamp(0, 1)
+        # 1 & 2. Scale Sync + Feature Matching
+        if self._match_at_ref_res:
+            # Upsample LQ to ref resolution — preserves ref feature quality
+            lr_for_match = F.interpolate(
+                lr.unsqueeze(0).float(), size=(ref_h, ref_w),
+                mode='bicubic', align_corners=False,
+            ).squeeze(0).clamp(0, 1)
+            img_a = self._to_uint8(lr_for_match)   # LQ at ref resolution
+            img_b = self._to_uint8(ref)             # ref at original resolution
+        else:
+            # Downsample ref to LQ resolution (original behavior)
+            ref_scaled = F.interpolate(
+                ref.unsqueeze(0).float(), size=(lr_h, lr_w),
+                mode='bicubic', align_corners=False,
+            ).squeeze(0).clamp(0, 1)
+            img_a = self._to_uint8(lr)              # LQ at original resolution
+            img_b = self._to_uint8(ref_scaled)      # ref downsampled to LQ resolution
 
-        # 2. Feature Matching
-        lr_np  = self._to_uint8(lr)
-        ref_np = self._to_uint8(ref_scaled)
-        mkpts_lr, mkpts_ref_s = self.xfeat.match_xfeat(lr_np, ref_np)
+        mkpts_a, mkpts_b = self.xfeat.match_xfeat(img_a, img_b)
 
-        if len(mkpts_lr) < 4:
+        if len(mkpts_a) < 4:
             return False
 
         # 3. RANSAC outlier removal
         method = getattr(cv2, 'USAC_MAGSAC', cv2.RANSAC)
         _, mask = cv2.findHomography(
-            mkpts_lr.astype(np.float32),
-            mkpts_ref_s.astype(np.float32),
-            method, 3.5, maxIters=1000, confidence=0.999,
+            mkpts_a.astype(np.float32),
+            mkpts_b.astype(np.float32),
+            method, self._ransac_threshold, maxIters=1000, confidence=0.999,
         )
-        if mask is None or int(mask.sum()) < 4:
+        if mask is None or int(mask.sum()) < self._min_inliers:
             return False
 
         inl = mask.flatten().astype(bool)
 
-        # 4. Re-project: scale ref keypoints from lr-res back to original ref-res
-        mkpts_ref_orig = mkpts_ref_s[inl].copy().astype(np.float32)
-        mkpts_ref_orig[:, 0] *= ref_w / lr_w
-        mkpts_ref_orig[:, 1] *= ref_h / lr_h
+        # 4. Re-project keypoints to original LQ / ref coordinate spaces
+        if self._match_at_ref_res:
+            # mkpts_a is in ref-res space → scale down to original LQ coords
+            mkpts_lr_orig = mkpts_a[inl].copy().astype(np.float32)
+            mkpts_lr_orig[:, 0] *= lr_w / ref_w
+            mkpts_lr_orig[:, 1] *= lr_h / ref_h
+            # mkpts_b is already in original ref coords
+            mkpts_ref_orig = mkpts_b[inl].astype(np.float32)
+        else:
+            # mkpts_a is already in original LQ coords
+            mkpts_lr_orig = mkpts_a[inl].astype(np.float32)
+            # mkpts_b is in LQ-res space → scale up to original ref coords
+            mkpts_ref_orig = mkpts_b[inl].copy().astype(np.float32)
+            mkpts_ref_orig[:, 0] *= ref_w / lr_w
+            mkpts_ref_orig[:, 1] *= ref_h / lr_h
 
-        self._mkpts_lr  = mkpts_lr[inl].astype(np.float32)
+        self._mkpts_lr  = mkpts_lr_orig
         self._mkpts_ref = mkpts_ref_orig
         self._ready = True
 
         n_in  = int(inl.sum())
-        n_raw = len(mkpts_lr)
-        print(f"  [FMT] {n_in}/{n_raw} inlier matches  "
-              f"(lr {lr_w}x{lr_h}, ref {ref_w}x{ref_h})")
+        n_raw = len(mkpts_a)
+        mode  = f"ref-res {ref_w}×{ref_h}" if self._match_at_ref_res \
+                else f"lq-res {lr_w}×{lr_h}"
+        print(f"  [FMT] {n_in}/{n_raw} inliers  "
+              f"(match@{mode}, threshold={self._ransac_threshold})")
         return True
 
     def get_ref_crops_batch(

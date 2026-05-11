@@ -215,6 +215,24 @@ xfeat_project_path: null    # 예) "../accelerated_features"
 #   내용: LQ 타일 그리드 + 특징점(타일별 색상) | Ref 특징점 + ref crop 박스 + 연결선
 visualize_feature_matching: false
 
+# ── Feature Matching 품질 튜닝 ─────────────────────────────────────────────
+#
+# fmt_ransac_threshold: RANSAC reprojection error 허용치 (매칭 공간 기준 픽셀).
+#   작을수록 엄격 (outlier 제거 잘 됨), 클수록 관대 (변형에 강함).
+#   생성형 AI 편집 + 약간의 rotation/열화 있을 때: 5.0 ~ 8.0 시도.
+#   기본값 3.5 (XFeat 권장값).
+fmt_ransac_threshold: 3.5
+#
+# fmt_min_inliers: RANSAC 후 최소 inlier 수. 이 수 미만이면 fallback으로 전환.
+#   매칭이 자주 실패하면 3으로 낮춰볼 것.
+#   기본값 4 (findHomography 최소 요구치).
+fmt_min_inliers: 4
+#
+# fmt_match_at_ref_resolution: true = LQ를 ref 해상도로 업샘플 후 매칭.
+#   ref 특징점 품질을 온전히 활용. ref가 LQ보다 고해상도일 때 매칭 품질 향상.
+#   false (기본) = ref를 LQ 해상도로 다운샘플 (기존 동작, 빠름).
+fmt_match_at_ref_resolution: false
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 사용 예시 (CLI)
 # ─────────────────────────────────────────────────────────────────────────────
