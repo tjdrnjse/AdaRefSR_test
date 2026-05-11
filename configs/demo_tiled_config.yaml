@@ -221,6 +221,13 @@ visualize_feature_matching: false
 #   작을수록 엄격 (outlier 제거 잘 됨), 클수록 관대 (변형에 강함).
 #   생성형 AI 편집 + 약간의 rotation/열화 있을 때: 5.0 ~ 8.0 시도.
 #   기본값 3.5 (XFeat 권장값).
+# fmt_matcher: feature matching 알고리즘 선택.
+#   'xfeat'       : XFeat MNN 매칭 (빠름, 기본값).
+#   'lighterglue' : XFeat + LighterGlue transformer 매칭.
+#                   appearance 변화 (생성형 AI 편집, texture 변화) 에 더 강함.
+#                   kornia 필요: pip install kornia
+fmt_matcher: xfeat
+#
 fmt_ransac_threshold: 3.5
 #
 # fmt_min_inliers: RANSAC 후 최소 inlier 수. 이 수 미만이면 fallback으로 전환.

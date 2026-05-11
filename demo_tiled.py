@@ -823,6 +823,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
                 ransac_threshold=float(args.get("fmt_ransac_threshold", 3.5)),
                 min_inliers=int(args.get("fmt_min_inliers", 4)),
                 match_at_ref_resolution=bool(args.get("fmt_match_at_ref_resolution", False)),
+                matcher=str(args.get("fmt_matcher", "xfeat")),
             )
             print(f">>> FeatureMatchingTiler: XFeat loaded from {xfeat_path}")
         else:

@@ -35,6 +35,7 @@ class FeatureMatchingTiler:
         ransac_threshold: float = 3.5,
         min_inliers: int = 4,
         match_at_ref_resolution: bool = False,
+        matcher: str = 'xfeat',
     ):
         """
         xfeat_project_path    : absolute path to the accelerated_features folder.
@@ -44,15 +45,25 @@ class FeatureMatchingTiler:
         match_at_ref_resolution: True  → upsample LQ to ref resolution before matching
                                          (preserves ref feature quality; slower).
                                  False → downsample ref to LQ resolution (original).
+        matcher               : 'xfeat'      → XFeat MNN (fast, default)
+                                'lighterglue' → XFeat + LighterGlue transformer matcher
+                                               (more robust to appearance changes; requires kornia)
         """
         if xfeat_project_path not in sys.path:
             sys.path.insert(0, xfeat_project_path)
         from modules.xfeat import XFeat
         self.xfeat = XFeat()
 
-        self._ransac_threshold    = ransac_threshold
-        self._min_inliers         = min_inliers
-        self._match_at_ref_res    = match_at_ref_resolution
+        self._ransac_threshold = ransac_threshold
+        self._min_inliers      = min_inliers
+        self._match_at_ref_res = match_at_ref_resolution
+
+        # Validate matcher choice and check kornia availability for lighterglue
+        if matcher == 'lighterglue' and not self.xfeat.kornia_available:
+            print("[FMT] WARNING: matcher='lighterglue' requires kornia "
+                  "(pip install kornia). Falling back to 'xfeat'.")
+            matcher = 'xfeat'
+        self._matcher = matcher
 
         self._ready = False
         self._mkpts_lr: Optional[np.ndarray] = None   # (N,2) x,y in LR canvas space
@@ -347,7 +358,16 @@ class FeatureMatchingTiler:
             img_a = self._to_uint8(lr)              # LQ at original resolution
             img_b = self._to_uint8(ref_scaled)      # ref downsampled to LQ resolution
 
-        mkpts_a, mkpts_b = self.xfeat.match_xfeat(img_a, img_b)
+        if self._matcher == 'lighterglue':
+            # XFeat detect → LighterGlue transformer match
+            out_a = self.xfeat.detectAndCompute(img_a, top_k=4096)[0]
+            out_b = self.xfeat.detectAndCompute(img_b, top_k=4096)[0]
+            out_a['image_size'] = (img_a.shape[1], img_a.shape[0])  # W, H
+            out_b['image_size'] = (img_b.shape[1], img_b.shape[0])
+            mkpts_a, mkpts_b, _ = self.xfeat.match_lighterglue(out_a, out_b)
+        else:
+            # XFeat MNN match (default)
+            mkpts_a, mkpts_b = self.xfeat.match_xfeat(img_a, img_b)
 
         if len(mkpts_a) < 4:
             return False
@@ -386,10 +406,11 @@ class FeatureMatchingTiler:
 
         n_in  = int(inl.sum())
         n_raw = len(mkpts_a)
-        mode  = f"ref-res {ref_w}×{ref_h}" if self._match_at_ref_res \
-                else f"lq-res {lr_w}×{lr_h}"
+        mode  = f"ref-res {ref_w}x{ref_h}" if self._match_at_ref_res \
+                else f"lq-res {lr_w}x{lr_h}"
         print(f"  [FMT] {n_in}/{n_raw} inliers  "
-              f"(match@{mode}, threshold={self._ransac_threshold})")
+              f"(matcher={self._matcher}, match@{mode}, "
+              f"threshold={self._ransac_threshold}, min_inliers={self._min_inliers})")
         return True
 
     def get_ref_crops_batch(
