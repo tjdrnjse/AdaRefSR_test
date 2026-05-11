@@ -558,6 +558,19 @@ def _infer_single_image(lq_path, ref_path, output_path,
     all_batches   = _make_batches(normal_tiles, 'normal') + _make_batches(face_tiles_pos, 'face')
     total_batches = len(all_batches)
 
+    # ── Pre-compute ALL FMT ref crops before GPU inference loop ──────────────
+    # get_ref_crops_batch is CPU-only work. Running it inside the GPU loop
+    # stalls the GPU between batches. Pre-computing here lets the GPU loop
+    # run without CPU interruptions.
+    _precomp_fm: dict = {}   # batch_idx -> (crops, coords)
+    if fmt is not None and fmt._ready and not enable_full_ref:
+        for _bi, (_tile_type, _batch_pos) in enumerate(all_batches):
+            if _tile_type == 'normal':
+                _precomp_fm[_bi] = fmt.get_ref_crops_batch(
+                    _batch_pos, tile_size, x_ref, tile_size, lq_h, lq_w,
+                )
+        print(f"  [FMT] Pre-computed ref crops for {len(_precomp_fm)} normal batches")
+
     for batch_idx, (tile_type, batch_pos) in enumerate(all_batches):
         B = len(batch_pos)
         print(f"    batch {batch_idx + 1}/{total_batches} [{tile_type}]  ({B} tiles)")
@@ -567,12 +580,10 @@ def _infer_single_image(lq_path, ref_path, output_path,
         tile_coords = []   # (ty, tx, ry, rx, rth, rtw) per tile in batch
         face_masks_per_tile: list = []
 
-        # Pre-compute feature-matching ref crops for normal batches (batched resize)
+        # Look up pre-computed FMT crops (no CPU work here during GPU loop)
         _fm_crops = _fm_coords = None
-        if tile_type == 'normal' and not enable_full_ref and fmt is not None and fmt._ready:
-            _fm_crops, _fm_coords = fmt.get_ref_crops_batch(
-                batch_pos, tile_size, x_ref, tile_size, lq_h, lq_w,
-            )
+        if batch_idx in _precomp_fm:
+            _fm_crops, _fm_coords = _precomp_fm[batch_idx]
 
         for i_tile, (ty, tx) in enumerate(batch_pos):
             # LQ tile: sliced from globally-preprocessed LQ (degrade_lr_tile already applied)

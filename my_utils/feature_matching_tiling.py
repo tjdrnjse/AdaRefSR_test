@@ -246,8 +246,13 @@ class FeatureMatchingTiler:
                 cv2.circle(ref_bgr, (rx, ry), 3, color, -1)
                 cv2.circle(ref_bgr, (rx, ry), 4, (255, 255, 255), 1)
 
-            # Ref crop box (tile_size_4x × tile_size_4x in orig ref space)
-            x0, y0, x1, y1 = self._bbox_from_median(ref_pts, ref_h, ref_w, tile_size_4x)
+            # Ref crop box: proportional size matching actual get_ref_crops_batch behavior
+            lq_h_4x = lr_h * scale
+            lq_w_4x = lr_w * scale
+            vis_crop_size = max(1, round(
+                tile_size_4x * ((ref_h / lq_h_4x) * (ref_w / lq_w_4x)) ** 0.5
+            ))
+            x0, y0, x1, y1 = self._bbox_from_median(ref_pts, ref_h, ref_w, vis_crop_size)
             bx0, by0 = int(x0 * sx), int(y0 * sy)
             bx1, by1 = int(x1 * sx), int(y1 * sy)
             cv2.rectangle(ref_bgr, (bx0, by0), (bx1, by1), color, 2)
@@ -380,6 +385,11 @@ class FeatureMatchingTiler:
         fallback_idx: List[int] = []
 
         # ── 5 & 6: feature-matched tiles ─────────────────────────────────────
+        # Proportional crop size: same spatial fraction as lr_tile_size / lq_h.
+        # Geometric mean of h/w scale factors handles differing aspect ratios.
+        ref_crop_size = max(1, round(
+            ref_tile_size * ((ref_h / lq_h) * (ref_w / lq_w)) ** 0.5
+        ))
         for i, (ty, tx) in enumerate(batch_pos):
             if self._ready:
                 ls = lr_tile_size
@@ -390,7 +400,7 @@ class FeatureMatchingTiler:
                 if in_tile.any():
                     ref_pts = self._mkpts_ref[in_tile]
                     x0, y0, x1, y1 = self._bbox_from_median(
-                        ref_pts, ref_h, ref_w, ref_tile_size,
+                        ref_pts, ref_h, ref_w, ref_crop_size,
                     )
                     crop = self._crop_or_pad(ref, x0, y0, x1, y1, ref_tile_size)
                     crops[i]  = crop
