@@ -210,6 +210,10 @@ face_ref_expand_ratio: 1.0
 #       (full_ref 모드에서는 per-tile ref crop 자체가 없음).
 use_feature_matching_tiling: false
 xfeat_project_path: null    # 예) "../accelerated_features"
+# visualize_feature_matching: true 이면 feature matching 결과를 시각화하여 결과 폴더에 저장.
+#   저장 파일명: <출력파일명>_fmt_vis.png
+#   내용: LQ 타일 그리드 + 특징점(타일별 색상) | Ref 특징점 + ref crop 박스 + 연결선
+visualize_feature_matching: false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 사용 예시 (CLI)

@@ -16,7 +16,9 @@ GPU batch optimisation: all fallback proportional crops that need resizing are
 stacked into a single F.interpolate call instead of per-tile calls.
 """
 
+import os
 import sys
+import colorsys
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -105,6 +107,185 @@ class FeatureMatchingTiler:
             ).squeeze(0).clamp(0, 1)
 
         return crop
+
+    @staticmethod
+    def _tile_starts(total: int, tile_size: int, overlap: int) -> list:
+        if total <= tile_size:
+            return [0]
+        stride = tile_size - overlap
+        coords = list(range(0, total - tile_size, stride))
+        last = max(0, total - tile_size)
+        if not coords or coords[-1] != last:
+            coords.append(last)
+        return coords
+
+    @staticmethod
+    def _hsv_palette(n: int) -> list:
+        """Generate n visually distinct BGR colors via HSV cycling."""
+        out = []
+        for i in range(max(n, 1)):
+            h = i / max(n, 1)
+            r, g, b = colorsys.hsv_to_rgb(h, 0.85, 0.95)
+            out.append((int(b * 255), int(g * 255), int(r * 255)))
+        return out
+
+    def save_match_visualization(
+        self,
+        save_path: str,
+        lr: torch.Tensor,
+        ref: torch.Tensor,
+        tile_size_4x: int,
+        overlap_4x: int,
+        scale: int,
+        max_dim: int = 1920,
+    ) -> None:
+        """
+        Save side-by-side feature match visualization.
+
+        Left panel : LQ with tile grid overlay (gray) + matched tiles (colored fill)
+                     + LQ keypoints colored by tile.
+        Right panel: Ref scaled to LQ resolution + matched ref keypoints
+                     + colored ref crop boxes.
+        Lines connecting matched LQ ↔ Ref keypoints (sampled, colored by tile).
+
+        Call BEFORE scaling _mkpts_lr by `scale` (i.e., _mkpts_lr must be in
+        original LQ coordinate space, same space as the `lr` tensor).
+        """
+        if not self._ready or self._mkpts_lr is None or self._mkpts_ref is None:
+            return
+
+        lr_np  = self._to_uint8(lr)    # [H, W, 3] RGB
+        ref_np = self._to_uint8(ref)   # [Hr, Wr, 3] RGB
+        lr_h, lr_w   = lr_np.shape[:2]
+        ref_h, ref_w = ref_np.shape[:2]
+
+        # Scale ref to LQ display size for side-by-side layout
+        ref_disp = cv2.resize(ref_np, (lr_w, lr_h), interpolation=cv2.INTER_LINEAR)
+        lr_bgr   = cv2.cvtColor(lr_np,   cv2.COLOR_RGB2BGR).copy()
+        ref_bgr  = cv2.cvtColor(ref_disp, cv2.COLOR_RGB2BGR).copy()
+
+        # Tile grid in original LQ space (4x tile params divided by scale)
+        ts = max(tile_size_4x // scale, 1)
+        ov = max(overlap_4x   // scale, 0)
+        ys = self._tile_starts(lr_h, ts, ov)
+        xs = self._tile_starts(lr_w, ts, ov)
+
+        mkpts_lr  = self._mkpts_lr   # (N,2) x,y in orig LQ space
+        mkpts_ref = self._mkpts_ref  # (N,2) x,y in orig ref space
+
+        # Assign each keypoint to the tile it falls in
+        tile_to_idx: dict = {}
+        for i in range(len(mkpts_lr)):
+            px, py = float(mkpts_lr[i, 0]), float(mkpts_lr[i, 1])
+            for ty in ys:
+                if ty <= py < ty + ts:
+                    for tx in xs:
+                        if tx <= px < tx + ts:
+                            tile_to_idx.setdefault((ty, tx), []).append(i)
+                            break
+                    break
+
+        # Tiles that have ≥1 matched keypoint, in grid order
+        matched_tiles = [(ty, tx) for ty in ys for tx in xs if (ty, tx) in tile_to_idx]
+        colors = self._hsv_palette(len(matched_tiles))
+        tile_color = {t: c for t, c in zip(matched_tiles, colors)}
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # Gray grid for all tiles on LQ
+        for ty in ys:
+            for tx in xs:
+                cv2.rectangle(
+                    lr_bgr,
+                    (tx, ty),
+                    (min(tx + ts, lr_w) - 1, min(ty + ts, lr_h) - 1),
+                    (70, 70, 70), 1,
+                )
+
+        # Semi-transparent colored fill for matched tiles
+        overlay = lr_bgr.copy()
+        for (ty, tx), color in tile_color.items():
+            cv2.rectangle(
+                overlay,
+                (tx, ty),
+                (min(tx + ts, lr_w) - 1, min(ty + ts, lr_h) - 1),
+                color, -1,
+            )
+        cv2.addWeighted(overlay, 0.22, lr_bgr, 0.78, 0, lr_bgr)
+
+        # Tile index labels on matched tiles
+        for k, (ty, tx) in enumerate(matched_tiles):
+            color = tile_color[(ty, tx)]
+            cx = min(tx + ts // 2, lr_w - 1)
+            cy = min(ty + ts // 2, lr_h - 1)
+            cv2.putText(lr_bgr, f"T{k}", (max(cx - 8, 0), max(cy + 5, 0)),
+                        font, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Keypoints on LQ colored by tile
+        for (ty, tx), idxs in tile_to_idx.items():
+            color = tile_color[(ty, tx)]
+            for i in idxs:
+                px, py = int(mkpts_lr[i, 0]), int(mkpts_lr[i, 1])
+                cv2.circle(lr_bgr, (px, py), 3, color, -1)
+                cv2.circle(lr_bgr, (px, py), 4, (255, 255, 255), 1)
+
+        # Ref display scale factors
+        sx = lr_w / ref_w
+        sy = lr_h / ref_h
+
+        # Keypoints + ref crop boxes on ref display panel
+        for (ty, tx), idxs in tile_to_idx.items():
+            color = tile_color[(ty, tx)]
+            ref_pts = mkpts_ref[idxs]
+
+            for i in idxs:
+                rx = int(mkpts_ref[i, 0] * sx)
+                ry = int(mkpts_ref[i, 1] * sy)
+                cv2.circle(ref_bgr, (rx, ry), 3, color, -1)
+                cv2.circle(ref_bgr, (rx, ry), 4, (255, 255, 255), 1)
+
+            # Draw the ref crop box (tile_size_4x × tile_size_4x in orig ref space)
+            x0, y0, x1, y1 = self._bbox_from_median(ref_pts, ref_h, ref_w, tile_size_4x)
+            bx0, by0 = int(x0 * sx), int(y0 * sy)
+            bx1, by1 = int(x1 * sx), int(y1 * sy)
+            cv2.rectangle(ref_bgr, (bx0, by0), (bx1, by1), color, 2)
+
+        # Combine panels side by side
+        combined = np.hstack([lr_bgr, ref_bgr])
+
+        # Connecting lines between matched LQ ↔ Ref keypoints (max 10 per tile)
+        _MAX_LINES = 10
+        for (ty, tx), idxs in tile_to_idx.items():
+            color = tile_color[(ty, tx)]
+            for i in idxs[:_MAX_LINES]:
+                p1 = (int(mkpts_lr[i, 0]),  int(mkpts_lr[i, 1]))
+                p2 = (int(mkpts_ref[i, 0] * sx) + lr_w, int(mkpts_ref[i, 1] * sy))
+                cv2.line(combined, p1, p2, color, 1, cv2.LINE_AA)
+
+        # Label bar
+        bar_h = 24
+        bar = np.zeros((bar_h, combined.shape[1], 3), dtype=np.uint8)
+        n_tiles  = len(matched_tiles)
+        n_inlier = len(mkpts_lr)
+        cv2.putText(bar,
+                    f"LQ  |  tile grid  ({n_tiles} matched tiles, {n_inlier} inliers)",
+                    (6, 17), font, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(bar, "Ref (scaled to LQ res)  |  crop boxes",
+                    (lr_w + 6, 17), font, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+        combined = np.vstack([bar, combined])
+
+        # Resize so the longer dimension ≤ max_dim
+        ch, cw = combined.shape[:2]
+        if max(ch, cw) > max_dim:
+            ratio = max_dim / max(ch, cw)
+            combined = cv2.resize(
+                combined, (int(cw * ratio), int(ch * ratio)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        cv2.imwrite(save_path, combined)
+        print(f"  [FMT] Match visualization saved: {save_path}")
 
     # ── Public API ────────────────────────────────────────────────────────────
 

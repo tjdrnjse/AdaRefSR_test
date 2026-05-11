@@ -456,6 +456,21 @@ def _infer_single_image(lq_path, ref_path, output_path,
     if fmt is not None:
         fmt_ready = fmt.prepare(x_lq_orig, x_ref)
         if fmt_ready:
+            # Visualize before *= scale so keypoints are still in orig LQ space
+            if args.get("visualize_feature_matching", False):
+                _stem = os.path.splitext(os.path.basename(output_path))[0]
+                _fmt_vis_path = os.path.join(
+                    os.path.dirname(os.path.abspath(output_path)),
+                    _stem + "_fmt_vis.png",
+                )
+                fmt.save_match_visualization(
+                    save_path=_fmt_vis_path,
+                    lr=x_lq_orig,
+                    ref=x_ref,
+                    tile_size_4x=tile_size,
+                    overlap_4x=overlap,
+                    scale=scale,
+                )
             fmt._mkpts_lr *= scale   # 원본 LR → 4x canvas 좌표계로 변환
         else:
             print("  [FMT] Feature matching failed – proportional fallback for all tiles.")
