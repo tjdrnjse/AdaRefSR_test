@@ -322,8 +322,10 @@ def _infer_single_image(lq_path, ref_path, output_path,
               f"preproc={'on' if enable_preproc else 'off'}")
 
     # AICGSteerer 초기화 (활성화된 경우에만)
+    # soft_mask_global 없으면 global_mode=True → 이미지 전체 token 에 steering 적용
     steerer: Optional[AICGSteerer] = None
-    if enable_steering and soft_mask_global is not None:
+    if enable_steering:
+        _global_mode = soft_mask_global is None
         steerer = AICGSteerer(
             net_sr.unet,
             scale=aicg_scale,
@@ -332,10 +334,12 @@ def _infer_single_image(lq_path, ref_path, output_path,
             force_verify=aicg_force_verify,
             attn1_face_scale=attn1_face_scale,
             fusion_blocks=args.get("fusion_blocks", "full"),
+            global_mode=_global_mode,
         )
         print(f"  AICGSteerer: trust_eff={steerer.effective_trust_scale:.3f}, "
               f"verify_eff={steerer.effective_verify_scale:.3f}, "
-              f"attn1_face={attn1_face_scale:.3f}")
+              f"attn1_face={attn1_face_scale:.3f}, "
+              f"global_mode={_global_mode}")
 
     # ── Global face preprocessing (전체 SR canvas 에서 1회만 수행) ──────────────
     # 타일 경계 아티팩트 방지 + 루프 내 CPU-GPU sync 제거.

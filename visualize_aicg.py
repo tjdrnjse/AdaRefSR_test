@@ -28,7 +28,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 # ============================================================================
@@ -214,6 +214,9 @@ class AICGVisualizer:
         # Map2 → LQ 공간 캔버스
         self.canvas2  = torch.zeros(lq_h, lq_w)
         self.cnt_lq   = torch.zeros(lq_h, lq_w)
+
+        # FMT 커버리지 패널용: 모든 타일의 ref crop 박스 누적
+        self._ref_crops: List[Tuple[int, int, int, int]] = []   # (ry, rx, rth, rtw)
 
         self._hook_handles:  list                              = []
         self._batch_accs:    Optional[List[_LayerAccumulator]] = None
@@ -402,6 +405,7 @@ class AICGVisualizer:
         self.canvas1[r0:r1, c0:c1] += to_2d_ref(m1)
         self.canvas3[r0:r1, c0:c1] += to_2d_ref(m3)
         self.cnt_ref[r0:r1, c0:c1] += 1.0
+        self._ref_crops.append((ref_ry, ref_rx, rth, rtw))
 
         # ── Map2 → LQ 캔버스 (1D → 2D 변환 후 스티칭) ───────────────────────
         ts = self.tile_size
@@ -510,6 +514,9 @@ class AICGVisualizer:
         b2 = blend(g2, lq_img,  is_gate=True)    # [lq_h,  lq_w,  3]
         b3 = blend(g3, ref_img, is_gate=False)   # [ref_h, ref_w, 3]
 
+        # ── Panel 4: Coverage heatmap + FMT crop boxes ──────────────────────
+        b4 = self._build_coverage_panel(ref_img, cm_fn)
+
         # 높이를 ref_h 로 통일
         target_h = ref_img.shape[0]
         if b2.shape[0] != target_h:
@@ -518,7 +525,7 @@ class AICGVisualizer:
                 Image.fromarray(b2).resize((new_w, target_h), Image.BILINEAR)
             )
 
-        out = np.concatenate([b1, b2, b3], axis=1)
+        out = np.concatenate([b1, b2, b3, b4], axis=1)
 
         out_dir = os.path.dirname(os.path.abspath(output_path))
         if out_dir:
@@ -526,3 +533,46 @@ class AICGVisualizer:
         Image.fromarray(out).save(output_path)
         print(f"[AICGVisualizer] 저장 완료: {output_path}  "
               f"({out.shape[1]}x{out.shape[0]} px)")
+
+    def _build_coverage_panel(
+        self,
+        ref_img: np.ndarray,
+        cm_fn,
+    ) -> np.ndarray:
+        """Coverage heatmap (cnt_ref) + tile crop 경계 박스 오버레이 → [ref_h, ref_w, 3]."""
+        # Coverage heatmap: cnt_ref 정규화 (0=미방문, max=최다 중복)
+        cov = self.cnt_ref.numpy()
+        cov_max = cov.max()
+        if cov_max > 0:
+            cov_n = cov / cov_max
+        else:
+            cov_n = cov
+        cov_rgb = (cm_fn(cov_n) * 255).astype(np.uint8)[:, :, :3]
+
+        # ref_img 와 50/50 블렌딩
+        panel = (
+            ref_img.astype(np.float32) * 0.5 + cov_rgb.astype(np.float32) * 0.5
+        ).clip(0, 255).astype(np.uint8)
+
+        # Tile crop 경계 박스 (PIL로 outline만 그림)
+        if self._ref_crops:
+            _COLORS = [
+                (255, 80,  80),   # red
+                (80,  200, 80),   # green
+                (80,  80,  255),  # blue
+                (255, 200, 50),   # yellow
+                (200, 80,  255),  # purple
+                (50,  220, 220),  # cyan
+                (255, 140, 0),    # orange
+                (180, 255, 100),  # lime
+            ]
+            img_pil = Image.fromarray(panel)
+            draw    = ImageDraw.Draw(img_pil)
+            for idx, (ry, rx, rth, rtw) in enumerate(self._ref_crops):
+                color = _COLORS[idx % len(_COLORS)]
+                x0, y0 = rx, ry
+                x1, y1 = rx + rtw - 1, ry + rth - 1
+                draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
+            panel = np.array(img_pil)
+
+        return panel

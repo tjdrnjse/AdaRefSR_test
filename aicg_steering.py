@@ -253,6 +253,7 @@ class AICGSteerer:
         attn1_face_scale:  float = 1.0,
         fusion_blocks:     str   = "full",
         verbose:           bool  = False,
+        global_mode:       bool  = False,
     ):
         self.unet              = unet
         self.scale             = float(scale)
@@ -265,6 +266,8 @@ class AICGSteerer:
         self.attn1_face_scale  = float(attn1_face_scale)
         self.fusion_blocks     = fusion_blocks
         self.verbose           = verbose
+        # global_mode=True: face mask 없이 모든 token 에 steering 적용 (FMT 전용 등)
+        self.global_mode       = bool(global_mode)
 
         # per-batch (re-set every tile-batch)
         self._batch_face_masks: Optional[List[Optional[torch.Tensor]]] = None
@@ -363,9 +366,13 @@ class AICGSteerer:
         모든 tile 의 face mask 가 None 이면 None 반환 → no-op.
         결과는 _query_mask_cache[L_q] 에 저장하여 같은 tile-batch 의 반복 호출을 O(1) 로 처리.
         """
-        if not self._batch_face_masks:
-            return None
-        if all(m is None for m in self._batch_face_masks):
+        no_mask = (not self._batch_face_masks) or all(m is None for m in self._batch_face_masks)
+        if no_mask:
+            if self.global_mode:
+                # 전체 token 에 steering 적용: all-True mask 반환
+                mask = torch.ones(B, L_q, dtype=torch.bool, device=device)
+                self._query_mask_cache[L_q] = mask
+                return mask
             return None
 
         # cache hit: same tile-batch, same token resolution → reuse
