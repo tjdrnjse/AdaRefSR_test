@@ -2,10 +2,12 @@ import torch
 import os
 import argparse
 import sys
+import math
 from typing import Optional
 import numpy as np
 from PIL import Image, ImageOps
 from torchvision import transforms
+import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 
 from main_code.model.gen_model import GenModel
@@ -209,6 +211,13 @@ def _infer_single_image(lq_path, ref_path, output_path,
     ).squeeze(0).clamp(0, 1)          # [3, H*scale, W*scale]
 
     lq_h, lq_w = x_lq.shape[1], x_lq.shape[2]
+
+    # ── Optional Gaussian blur on 4x canvas (FMT uses x_lq_orig, unaffected) ─
+    lq_blur_sigma = float(args.get("lq_blur_sigma", 0.0))
+    if lq_blur_sigma > 0.0:
+        _ks = 2 * int(math.ceil(3.0 * lq_blur_sigma)) + 1
+        x_lq = TF.gaussian_blur(x_lq, kernel_size=_ks, sigma=lq_blur_sigma).clamp(0, 1)
+        print(f"  LQ blur: sigma={lq_blur_sigma:.2f}, kernel={_ks}x{_ks}")
 
     lq_bicubic_img = transforms.ToPILImage()(x_lq.cpu())
 
@@ -650,6 +659,11 @@ if __name__ == "__main__":
                              help="AICG Trust/Verify/Combined 히트맵 시각화 활성화.")
     demo_parser.add_argument("--vis_output_path", type=str,  default=None,
                              help="시각화 PNG 저장 경로 (미지정 시 output_path 옆에 자동 생성).")
+
+    # ── LR Blur ──────────────────────────────────────────────────────────────
+    demo_parser.add_argument("--lq_blur_sigma", type=float, default=None,
+                             help="4x canvas LR 에 적용할 Gaussian blur sigma "
+                                  "(default 0.0 = no blur). FMT 매칭은 blur 전 원본 LR 사용.")
 
     # ── AICG Steering ────────────────────────────────────────────────────────
     demo_parser.add_argument("--enable_steering",     action="store_true", default=None,

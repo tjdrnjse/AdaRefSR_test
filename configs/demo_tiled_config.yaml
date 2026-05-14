@@ -39,6 +39,14 @@ tile_batch_size: 4
 #   - Must match the training-time upscale ratio (default 4×).
 scale: 4
 
+# ── LR Blur (4x canvas) ──────────────────────────────────────────────────────
+# lq_blur_sigma: SR 전에 4x LR canvas 에 적용할 Gaussian blur sigma.
+#   - 0.0 (기본) : blur 없음.
+#   - 양수        : sigma 값에 따라 kernel_size = 2*ceil(3*sigma)+1 로 자동 결정.
+#   - FMT 특징점 매칭은 blur 적용 전 원본 해상도 LR 로 수행되므로 영향 없음.
+#   - wavelet color fix 는 blur 된 LR 을 기준으로 수행됨.
+lq_blur_sigma: 0.0
+
 # ── AICG 시각화 설정 (visualize_aicg.py) ────────────────────────────────────
 # visualize: true 로 설정하면 인퍼런스와 동시에 3종 히트맵을 생성.
 #   - Map1 Trust    : 모든 LQ 토큰이 Ref 이미지의 어느 위치를 참조했는지 (Eq.2 A_RA)
