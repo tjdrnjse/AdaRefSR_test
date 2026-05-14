@@ -172,7 +172,7 @@ class AICGVisualizer:
 
     demo_tiled.py 통합 예시:
     ─────────────────────────────────────────────────────────
-        viz = AICGVisualizer(net_sr.unet, roi_mask,
+        viz = AICGVisualizer(net_sr.unet,
                              ref_h, ref_w, lq_h, lq_w, tile_size)
 
         for batch_start in range(0, n_tiles, batch_sz):
@@ -188,7 +188,6 @@ class AICGVisualizer:
     def __init__(
         self,
         unet,
-        roi_mask:      Optional[np.ndarray],   # [lq_h, lq_w] float32 0~1 or None
         ref_h:         int,
         ref_w:         int,
         lq_h:          int,
@@ -198,7 +197,6 @@ class AICGVisualizer:
         steerer=None,  # Optional[AICGSteerer] – inject to use cached probs/gate
     ):
         self.unet      = unet
-        self.roi_mask  = roi_mask
         self.steerer   = steerer   # if provided, hook reads steerer._last_probs/_last_gate
         self.ref_h     = ref_h
         self.ref_w     = ref_w
@@ -436,17 +434,8 @@ class AICGVisualizer:
         ts = self.tile_size
         B  = len(tile_coords)
 
-        self._batch_roi_pix = []
-        for (ty, tx, *_) in tile_coords:
-            if self.roi_mask is not None:
-                crop = self.roi_mask[ty:ty + ts, tx:tx + ts].astype(np.float32)
-                if crop.shape[0] != ts or crop.shape[1] != ts:
-                    padded = np.zeros((ts, ts), dtype=np.float32)
-                    padded[:crop.shape[0], :crop.shape[1]] = crop
-                    crop = padded
-                self._batch_roi_pix.append(torch.from_numpy(crop))
-            else:
-                self._batch_roi_pix.append(None)
+        # roi_vec = all-ones → 전체 토큰을 균등 가중치로 시각화
+        self._batch_roi_pix = [None] * B
 
         self._batch_accs = [_LayerAccumulator() for _ in range(B)]
 

@@ -37,155 +37,51 @@ tile_batch_size: 4
 
 # scale: SR upscale factor.
 #   - Must match the training-time upscale ratio (default 4×).
-#   - LQ is bicubic-upscaled by this factor before tiling; output is scale× larger than input LQ.
 scale: 4
 
 # ── AICG 시각화 설정 (visualize_aicg.py) ────────────────────────────────────
 # visualize: true 로 설정하면 인퍼런스와 동시에 3종 히트맵을 생성.
-#   - Map1 Trust    : ROI 영역 픽셀이 Ref 이미지의 어느 위치를 참조했는지 (Eq.2 A_RA)
-#   - Map2 Verify   : AICG Gate(G) 값을 Ref 공간으로 역투영 (Eq.6 G)
-#   - Map3 Combined : 최종 복원에 기여한 Ref 위치 ((ROI×G) → Ref 공간, Eq.7)
-#   출력: [Trust | Verify | Combined] 3패널을 가로 연결한 고해상도 PNG
+#   - Map1 Trust    : 모든 LQ 토큰이 Ref 이미지의 어느 위치를 참조했는지 (Eq.2 A_RA)
+#   - Map2 Verify   : AICG Gate(G) 값 분포 (Eq.6 G)
+#   - Map3 Combined : 최종 복원에 기여한 Ref 위치 (G → Ref 공간, Eq.7)
+#   출력: [Trust | Verify | Combined | Coverage] 4패널을 가로 연결한 고해상도 PNG
 visualize: false
-
-# roi_path: LQ 관심 영역(ROI) 마스크 경로.
-#   - 단일 파일: grayscale PNG 1장을 모든 이미지에 공통 적용.
-#   - 폴더 지정: lq_path/ref_path 와 동일한 파일명으로 이미지별 매칭.
-#               매칭 파일이 없는 경우 해당 이미지는 전체 영역을 ROI로 사용 (경고 출력).
-#   - 픽셀값: 0(무관심) ~ 255(관심), LQ 해상도와 다르면 자동 리사이즈.
-#   - null 로 두면 전체 영역을 ROI로 간주.
-roi_path: null   # 예) "./assets/roi/img_mask.png"  또는  "./assets/roi/"
 
 # vis_output_path: 시각화 PNG 저장 경로.
 #   - null 로 두면 output_path 와 동일 디렉터리에 "<파일명>_aicg_vis.png" 로 자동 저장.
 vis_output_path: null   # 예) "./assets/results/img_aicg_vis.png"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AICG Steering & Face Preprocessing (얼굴 ID 보존을 위한 강화 옵션)
+# AICG Steering (FMT-matched tile 에 대한 Trust/Verify 강화)
 # ─────────────────────────────────────────────────────────────────────────────
 # 동작 조건:
-#   - roi_path 가 지정되어 있어야 함 (얼굴 영역 마스크).
-#   - enable_steering 과 enable_face_preproc 는 독립적으로 켤 수 있음.
+#   - enable_steering: true 로 설정해야 함.
+#   - use_feature_matching_tiling: true 일 때: FMT로 매칭된 tile에만 steering 적용.
+#                                  false 일 때: 모든 tile에 전역 steering 적용.
 #
-# 권장 사용:
-#   enable_steering: true        # AICGSteerer Trust/Verify 강화
-#   enable_face_preproc: true    # 얼굴 영역 LR 픽셀에 동적 Blur + Monochrome noise
-#
-# 두 옵션의 역할:
-#   * face_preproc : 픽셀 공간 (VAE 통과 전) 에서 얼굴 영역의 구조적 단서를 흐리게 만들고
-#                    monochrome noise 주입. 모델이 LQ 의 손상된 얼굴 디테일에 의존하지 않고
-#                    Ref 로부터 ID 를 가져오도록 유도.
-#   * steering     : Attention 단계에서 직접 개입.  Trust(logit) 와 Verify(gate G) 를
-#                    얼굴 영역에서만 강제 증폭하여 Ref 의 영향을 명시적으로 끌어올림.
+# 두 개의 intervention:
+#   * Trust  : Q·K^T logit 에 trust_scale 을 곱해 Ref 집중도 강화.
+#   * Verify : Gate G 에 verify_scale 을 곱해 Ref 신호 통과량 강화.
 enable_steering:     false
-enable_face_preproc: false
 
 # ── AICGSteerer 강화 배율 (effective = scale * individual) ────────────────
 # scale=1.0, trust_scale=1.0, verify_scale=1.0  → 완전한 no-op (회귀 위험 0)
 aicg_scale:          1.0    # 전역 multiplier: 0.5 ~ 1.5
 aicg_trust_scale:    1.8    # Trust (Q·K^T pre-softmax logit scale).  1.5 ~ 2.5 권장
 aicg_verify_scale:   2.0    # Verify (Gate G post-sigmoid scale).      1.5 ~ 3.0 권장.
-                            # 수치가 클수록 face 영역에서 G 가 1.0 에 클램프되어 강제 개방됨.
-# aicg_force_verify: true 이면 verify_scale 값과 무관하게 face 영역 gate 를 무조건 1.0 으로 강제.
-#   false(기본) → clamp(gate * verify_scale, 0, 1)  (soft scaling)
-#   true        → gate = 1.0 무조건 (Hard Override, 가장 강한 Ref 강제 개방)
+# aicg_force_verify: true 이면 verify_scale 무관하게 gate 를 무조건 1.0 으로 강제.
 aicg_force_verify:   false
 
-# ── Face mask softening ─────────────────────────────────────────────────
-face_soft_mask:      true   # hard box → Gaussian blur soft mask (타일 경계 자연스러움)
-
-# ── 동적 Blur sigma (원본 해상도 face box 픽셀 크기에 비례) ─────────────
-# sigma = clamp(face_box_max_px * sigma_ratio, [sigma_min, sigma_max])
-# 예) face_box_max=256 → sigma = 0.02 * 256 = 5.12  (clamp 내)
-#     face_box_max=128 → sigma = 0.02 * 128 = 2.56
-face_sigma_ratio:    0.02
-face_sigma_min:      1.5
-face_sigma_max:      8.0
-
-# ── LR Image degradation params ─────────────────────────────────────────
-# face_noise_std : Monochrome Gaussian noise std (in [-1, 1] 공간)
-#                  RGB 독립 노이즈 X (chroma 노이즈 방지) → 단채널 broadcast
-#                  0.05 ~ 0.15 권장.  너무 크면 OOD, 너무 작으면 효과 미미.
-face_noise_std:      0.08
-
-# face_blend_ratio : degraded vs 원본 LR 의 혼합 비율 (도메인 시프트 방어)
-#                    0.0 = 전혀 degrade 안 함, 1.0 = 완전 degrade
-#                    0.4 ~ 0.7 권장.
-face_blend_ratio:    0.6
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Change 1 — Pixelization (Mosaic) for LR face degradation
-# ─────────────────────────────────────────────────────────────────────────────
-# face_preproc.degrade_lr_tile 의 내부 동작이 Gaussian blur 에서 Pixelization
-# (block-area downsample → bilinear upsample) 으로 대체됨.  잘못된 LR 얼굴
-# ID 단서를 더 강하게 지워 Ref ID 가 우세해지도록 유도.
-#
-# face_pixel_block_size : pixelization 블록 크기 (px).
-#   - 8 (default) : 약 8x8 블록 단위로 Mosaic.  중간 강도.
-#   - 16          : 더 강한 Mosaic (LR 디테일 거의 소실).
-#   - <=1         : Pixelization 비활성 (no-op).
-#   - enable_face_preproc=true 일 때만 적용됨.
-face_pixel_block_size: 8
-
-# ── Degraded LR 저장 옵션 ──────────────────────────────────────────────────
-# save_degraded_lr: true 로 설정하면 pixelization+noise 가 적용된 LR 이미지를
-#   output_path 와 같은 디렉터리에 <stem><suffix>.png 로 저장.
-#   - enable_face_preproc 가 true 일 때만 유효 (false 이면 원본 LQ와 동일하므로 저장 생략).
-# degraded_lr_suffix: 저장 파일명 접미사 (확장자 제외).
-save_degraded_lr:    false
-degraded_lr_suffix:  "_degrad_lr"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Change 2 — Full Ref Attention (single-pass global ref)
+# Full Ref Attention (single-pass global ref)
 # ─────────────────────────────────────────────────────────────────────────────
 # ref 를 1회만 (full_ref_size, full_ref_size) 로 resize 한 뒤 모든 LR tile 이
 # 동일한 ref bank 를 공유.  per-tile proportional ref crop 로직은 비활성됨.
-# 효과:
-#   - 모든 LR 위치가 ref 전체를 attention 으로 볼 수 있음 → 얼굴 ID 단서가
-#     멀리 떨어진 위치까지 전달됨.
-#   - net_ref forward 와 ref_reader.update 가 루프 밖에서 1회만 실행 → 속도 향상.
-#   - ref_tensor 는 reference_attention.py 내부에서 expand 로 batch 차원만 확장
-#     되어 메모리 추가 비용은 거의 없음.
 #
 # enable_full_ref : false 이면 기존 per-tile ref crop 동작 (수치적으로 원본 동일).
 # full_ref_size   : 글로벌 ref 의 H=W.  1024 가 기본값.  GPU VRAM 에 따라 조정.
 enable_full_ref:     false
 full_ref_size:       1024
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Change 3 — attn1 face token scaling (read mode self-attention weakening)
-# ─────────────────────────────────────────────────────────────────────────────
-# read 모드 BasicTransformerBlock 에서 self-attention(attn1) 출력을
-# hidden_states 에 더하기 직전, face_token_mask 가 있는 위치에서만 scale 곱.
-# 의도: LR 자기 self-attn 을 face 영역에서 약화시켜 Ref attention 의 영향이
-# 상대적으로 더 강해지도록 유도 (얼굴 ID 보존 보강).
-#
-# attn1_face_scale :
-#   - 1.0 (default) : 완전한 no-op (회귀 위험 0).
-#   - <1.0          : face 영역 attn1 약화 (예: 0.3, 0.5)
-#   - 0.0           : face 영역 attn1 완전 차단 (Ref 만 의존)
-#   - enable_steering 이 켜져 있고 ROI mask 가 주어졌을 때만 적용됨.
-#     (mask source 는 AICGSteerer.build_query_mask 결과를 공유)
-attn1_face_scale:    1.0
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Change 4 — Expanded Ref Tile for Face Region (token-length extension)
-# ─────────────────────────────────────────────────────────────────────────────
-# mask 영역(얼굴)을 포함하는 LR tile 에 대해 ref 를 더 넓은 영역에서 잘라
-# net_ref 에 resize 없이 그대로 통과시킴.
-# → ref bank 에 더 많은 spatial token 이 쌓여 attention 이 더 넓은 ref 맥락을 봄.
-# → LR 과 ref 간 얼굴 위치가 100~200px 어긋나도 correct face 를 attend 할 수 있음.
-#
-# 동작 조건:
-#   - roi_path 가 지정되어 있어야 함 (얼굴 영역 마스크).
-#   - enable_full_ref 와 병용 불가 (full_ref 는 이미 전체 ref 를 사용).
-#
-# face_ref_expand_ratio :
-#   - 1.0 (default) : 비활성 (no-op). 기존 per-tile 비례 crop 동작 유지.
-#   - 2.0           : 가로/세로 2배 넓은 ref crop → 4배 토큰. 권장 시작값.
-#   - 3.0           : 더 넓은 커버리지. VRAM attention 비용 증가.
-#   - ref crop 크기는 VAE+UNet 제약으로 64 배수 로 자동 정렬됨.
-face_ref_expand_ratio: 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # XFeat Feature Matching Tiling (Dynamic Ref Tile Selection)
@@ -201,50 +97,45 @@ face_ref_expand_ratio: 1.0
 #   5. Tile Filter   : lr 타일 내 특징점 검색
 #   6. Median Crop   : median(ref pts) 중심의 고정 크기 BBox 크롭
 #   7. Fallback      : lr 타일에 특징점 없으면 기존 비례 크롭으로 폴백
+#                      (fallback tile 은 steering 도 적용되지 않음)
+#
+# enable_steering=true 와 함께 사용하면:
+#   - FMT matched tile: ref = FMT crop, steering ON
+#   - FMT fallback tile: ref = 비례 크롭 (같은 위치), steering OFF
 #
 # xfeat_project_path: accelerated_features 폴더 경로.
 #   런타임에 sys.path.insert 로 동적 로드됨.
-#   예) "../accelerated_features" 또는 절대 경로
 #
 # 주의: enable_full_ref=true 와 병용 시 feature matching 은 자동 비활성됨
 #       (full_ref 모드에서는 per-tile ref crop 자체가 없음).
 use_feature_matching_tiling: false
 xfeat_project_path: null    # 예) "../accelerated_features"
+
 # visualize_feature_matching: true 이면 feature matching 결과를 시각화하여 결과 폴더에 저장.
 #   저장 파일명: <출력파일명>_fmt_vis.png
-#   내용: LQ 타일 그리드 + 특징점(타일별 색상) | Ref 특징점 + ref crop 박스 + 연결선
 visualize_feature_matching: false
 
 # ── Feature Matching 품질 튜닝 ─────────────────────────────────────────────
 #
 # fmt_ransac_threshold: RANSAC reprojection error 허용치 (매칭 공간 기준 픽셀).
-#   작을수록 엄격 (outlier 제거 잘 됨), 클수록 관대 (변형에 강함).
-#   생성형 AI 편집 + 약간의 rotation/열화 있을 때: 5.0 ~ 8.0 시도.
-#   기본값 3.5 (XFeat 권장값).
-# fmt_matcher: feature matching 알고리즘 선택.
-#   'xfeat'       : XFeat MNN 매칭 (빠름, 기본값).
-#   'lighterglue' : XFeat + LighterGlue transformer 매칭.
-#                   appearance 변화 (생성형 AI 편집, texture 변화) 에 더 강함.
-#                   kornia 필요: pip install kornia
+#   기본값 3.5 (XFeat 권장값).  생성형 AI 편집 + 변형 있을 때: 5.0 ~ 8.0 시도.
+# fmt_matcher: 'xfeat' (MNN, 기본) 또는 'lighterglue' (kornia 필요, 더 강건).
 fmt_matcher: xfeat
-#
 fmt_ransac_threshold: 3.5
-#
-# fmt_min_inliers: RANSAC 후 최소 inlier 수. 이 수 미만이면 fallback으로 전환.
-#   매칭이 자주 실패하면 3으로 낮춰볼 것.
-#   기본값 4 (findHomography 최소 요구치).
+
+# fmt_min_inliers: RANSAC 후 최소 inlier 수. 이 수 미만이면 전체 폴백.
+#   기본값 4 (findHomography 최소 요구치).  자주 실패하면 3으로 낮춰볼 것.
 fmt_min_inliers: 4
-#
-# fmt_match_at_ref_resolution: true = LQ를 ref 해상도로 업샘플 후 매칭.
-#   ref 특징점 품질을 온전히 활용. ref가 LQ보다 고해상도일 때 매칭 품질 향상.
-#   false (기본) = ref를 LQ 해상도로 다운샘플 (기존 동작, 빠름).
+
+# fmt_match_at_ref_resolution: true = LQ를 ref 해상도로 업샘플 후 매칭 (고품질, 느림).
+#   false (기본) = ref를 LQ 해상도로 다운샘플.
 fmt_match_at_ref_resolution: false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 사용 예시 (CLI)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# [예시 1] 단일 이미지 SR + 시각화 (ROI 없음 – 전체 영역)
+# [예시 1] 단일 이미지 SR + 시각화
 #
 #   python demo_tiled.py \
 #     --lq_path     ./assets/lq/sample.png \
@@ -252,76 +143,37 @@ fmt_match_at_ref_resolution: false
 #     --output_path ./assets/results/sample.png \
 #     --visualize
 #
-#   → SR 결과: ./assets/results/sample.png
-#   → 히트맵:  ./assets/results/sample_aicg_vis.png  (Trust | Verify | Combined)
-#
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# [예시 2] 단일 이미지 SR + 시각화 (사용자 ROI 마스크 지정)
-#
-#   python demo_tiled.py \
-#     --lq_path        ./assets/lq/sample.png \
-#     --ref_path       ./assets/ref/sample.png \
-#     --output_path    ./assets/results/sample.png \
-#     --visualize \
-#     --roi_path       ./assets/roi/sample_mask.png \
-#     --vis_output_path ./assets/results/sample_vis.png
-#
-#   → ROI 마스크(grayscale PNG)가 지정된 영역만 Trust/Combined 맵에 반영됨.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# [예시 3] 폴더 배치 처리 + 시각화 (ROI도 폴더로 지정)
+# [예시 2] 폴더 배치 처리
 #
 #   python demo_tiled.py \
 #     --lq_path     ./assets/lq/ \
 #     --ref_path    ./assets/ref/ \
 #     --output_path ./assets/results/ \
-#     --visualize \
-#     --roi_path    ./assets/roi/
-#
-#   → lq/, ref/, roi/ 안의 동일 파일명 이미지를 자동 매칭하여 전부 처리.
-#   → roi/ 에 해당 파일이 없는 이미지는 전체 영역을 ROI로 사용 (경고 출력).
-#   → 각 이미지에 대해 results/<파일명>_aicg_vis.png 생성.
+#     --visualize
 #
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# [예시 3-b] 폴더 배치 처리 + ROI 단일 파일 공통 적용
+# [예시 3] FMT + Steering (matched tile만 steering)
 #
 #   python demo_tiled.py \
-#     --lq_path     ./assets/lq/ \
-#     --ref_path    ./assets/ref/ \
-#     --output_path ./assets/results/ \
-#     --visualize \
-#     --roi_path    ./assets/roi/common_mask.png
+#     --lq_path     ./assets/lq/sample.png \
+#     --ref_path    ./assets/ref/sample.png \
+#     --output_path ./assets/results/sample.png \
+#     --use_feature_matching_tiling \
+#     --xfeat_project_path ../accelerated_features \
+#     --enable_steering
 #
-#   → ROI 마스크 1장을 모든 이미지에 동일하게 적용.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# [예시 4] YAML에서 시각화 기본값 활성화 (이 파일 수정)
-#
-#   visualize:        true
-#   roi_path:         null          # 또는 "./assets/roi/mask.png"
-#   vis_output_path:  null          # 자동 경로
-#
-#   python demo_tiled.py --config ./configs/demo_tiled_config.yaml \
-#     --lq_path ./assets/lq/ --ref_path ./assets/ref/ --output_path ./out/
+#   → FMT로 매칭된 tile: FMT ref crop + Trust/Verify steering 적용
+#   → FMT fallback tile: 비례 ref crop + steering 없음
 #
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # [히트맵 해석 가이드]
 #
-#   Map1 Trust    – 밝은 영역: LQ ROI 가 Ref 이미지의 해당 위치를 강하게 참조함.
-#                  어두운 영역: 참조가 거의 없어 SR에 Ref 기여 없음.
-#
+#   Map1 Trust    – 밝은 영역: LQ 가 Ref 이미지의 해당 위치를 강하게 참조함.
 #   Map2 Verify   – 밝은 영역: AICG Gate가 열려 있어 Ref 정보가 신뢰됨.
-#                  어두운 영역: Gate가 닫혀 있어 Ref 정보가 억제됨 (불일치 감지).
-#
 #   Map3 Combined – Map1 × Map2. 실제 복원에 기여한 Ref의 유효 위치.
-#                  Trust 하고 Verify 된 교집합 영역.
-#
-#   세 맵이 모두 어두우면 → SR이 Ref 없이 내재적 prior 만으로 복원됨.
-#   Map1은 밝은데 Map2가 어두우면 → LQ가 Ref를 참조했지만 AICG가 억제함
-#                                     (Ref 품질 불량 / 의미론적 불일치).
+#   Map4 Coverage – ref crop 방문 횟수 히트맵 + tile crop 경계 박스.
 # ─────────────────────────────────────────────────────────────────────────────

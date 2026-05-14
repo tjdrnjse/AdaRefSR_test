@@ -171,19 +171,6 @@ class ReferenceNetAttention():
                                                 encoder_hidden_states=norm_hidden_states,
                                                 attention_mask=attention_mask)
 
-                    # Change 3: face token 영역에서만 attn1 출력 스케일.
-                    # AICGSteerer.apply_steering() 컨텍스트가 self._face_mask_steerer 와
-                    # self._face_attn1_scale 를 등록·해제한다. attribute 가 없거나 scale==1.0
-                    # 이거나 face mask 가 None 이면 완전한 no-op (수치 회귀 0).
-                    _steerer = getattr(self, '_face_mask_steerer', None)
-                    _scale   = float(getattr(self, '_face_attn1_scale', 1.0))
-                    if _steerer is not None and _scale != 1.0:
-                        _Bq, _Lq = attn_output_attn_1.shape[0], attn_output_attn_1.shape[1]
-                        _fm = _steerer.build_query_mask(_Bq, _Lq, attn_output_attn_1.device)
-                        if _fm is not None:
-                            _m = _fm.unsqueeze(-1).to(attn_output_attn_1.dtype)        # [B, L_q, 1]
-                            attn_output_attn_1 = attn_output_attn_1 * (_m * _scale + (1.0 - _m))
-
                     hidden_states = attn_output_attn_1 + hidden_states
                     
                     # 1.2 GLIGEN Control

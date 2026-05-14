@@ -421,7 +421,7 @@ class FeatureMatchingTiler:
         ref_tile_size: int,
         lq_h: int,
         lq_w: int,
-    ) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, int]]]:
+    ) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, int]], List[bool]]:
         """
         Compute ref crops for a batch of LR tiles in one call.
 
@@ -433,14 +433,16 @@ class FeatureMatchingTiler:
 
         Returns
         -------
-        crops  : list of [3, ref_tile_size, ref_tile_size] CPU float32 tensors
-        coords : list of (ry, rx, rth, rtw) for visualiser compatibility
+        crops         : list of [3, ref_tile_size, ref_tile_size] CPU float32 tensors
+        coords        : list of (ry, rx, rth, rtw) for visualiser compatibility
+        matched_flags : list of bool — True if tile got an FMT match, False if proportional fallback
         """
         ref_h, ref_w = ref.shape[1], ref.shape[2]
         n = len(batch_pos)
-        crops:  List[Optional[torch.Tensor]]          = [None] * n
-        coords: List[Tuple[int, int, int, int]]       = [(0, 0, ref_h, ref_w)] * n
-        fallback_idx: List[int] = []
+        crops:         List[Optional[torch.Tensor]]    = [None] * n
+        coords:        List[Tuple[int, int, int, int]] = [(0, 0, ref_h, ref_w)] * n
+        matched_flags: List[bool]                      = [True] * n   # assume matched; fallback marks False
+        fallback_idx:  List[int] = []
 
         # ── 5 & 6: feature-matched tiles ─────────────────────────────────────
         # Proportional crop size: same spatial fraction as lr_tile_size / lq_h.
@@ -466,6 +468,7 @@ class FeatureMatchingTiler:
                     continue
 
             fallback_idx.append(i)
+            matched_flags[i] = False   # no keypoints in tile → proportional fallback
 
         # ── 7: proportional fallback — batch resize in one F.interpolate call ─
         if fallback_idx:
@@ -496,4 +499,4 @@ class FeatureMatchingTiler:
                     crops[i]  = fb_raw[j].clamp(0, 1)
                     coords[i] = fb_coord[j]
 
-        return crops, coords  # type: ignore[return-value]
+        return crops, coords, matched_flags  # type: ignore[return-value]
