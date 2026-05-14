@@ -270,6 +270,7 @@ class AICGVisualizer:
                     if (
                         steerer is not None
                         and steerer.capture_for_viz
+                        and steerer.is_active()
                         and steerer._last_probs is not None
                         and steerer._last_gate  is not None
                     ):
