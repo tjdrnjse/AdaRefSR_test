@@ -188,6 +188,8 @@ class AICGVisualizer:
     def __init__(
         self,
         unet,
+        roi_mask=None,   # kept for API compatibility (unused – face code removed)
+        *,
         ref_h:         int,
         ref_w:         int,
         lq_h:          int,

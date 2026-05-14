@@ -297,6 +297,9 @@ def _infer_single_image(lq_path, ref_path, output_path,
                     x_src_t, x_ref_t, [prompt_src], [prompt_ref], weight_dtype,
                 )
 
+        if _steer_single:
+            steerer.set_batch_face_masks([torch.ones(tile_size, tile_size)])
+
         if visualize:
             _vis_output = _resolve_vis_path(vis_output_path, output_path)
             if steerer is not None:
@@ -322,6 +325,9 @@ def _infer_single_image(lq_path, ref_path, output_path,
                     preds = _run_infer()
             else:
                 preds = _run_infer()
+
+        if _steer_single:
+            steerer.clear_batch_face_masks()
 
         if enable_full_ref:
             ref_writer.clear()
@@ -476,6 +482,9 @@ def _infer_single_image(lq_path, ref_path, output_path,
         # Steering: FMT-matched tiles (tile_type='fmt') or all tiles when FMT not used
         _apply_steer = steerer is not None and (tile_type == 'fmt' or fmt is None)
 
+        if _apply_steer:
+            steerer.set_batch_face_masks([torch.ones(tile_size, tile_size)] * B)
+
         if viz is not None and _apply_steer:
             with viz.capture_batch(tile_coords, lq_h, lq_w), steerer.apply_steering():
                 predictions = _run_batch()
@@ -487,6 +496,9 @@ def _infer_single_image(lq_path, ref_path, output_path,
                 predictions = _run_batch()
         else:
             predictions = _run_batch()
+
+        if _apply_steer:
+            steerer.clear_batch_face_masks()
 
         for k, (ty, tx) in enumerate(batch_pos):
             w    = tile_weight_map(tile_size, overlap, ty, tx, lq_h, lq_w).to(device)

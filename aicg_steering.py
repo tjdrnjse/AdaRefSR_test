@@ -13,22 +13,26 @@ AICG 모듈 내부 연산 흐름 (paper Eq.1~7):
     G    = σ( mean_M,heads(Smap) )
     Out  = ZeroLinear( A_RA @ V ) ⊙ G + H_src
 
-Intervention (전체 토큰에 적용):
+Intervention (mask 지정 토큰에만 적용):
     Trust 강화 (Logit Scaling):
-        모든 query 위치에서 Softmax 직전 logit 에 trust_scale 곱
-        → A_RA 가 Ref 토큰에 더 sharp 하게 집중
+        mask 위치의 query 에서 Softmax 직전 logit 에 trust_scale 곱
     Verify 강화 (Gate G Forcing):
-        모든 위치에서 G ← clamp(G * verify_scale, 0, 1)
-        → AICG 가 Ref 정보를 더 강하게 통과시킴
+        mask 위치에서 G ← clamp(G * verify_scale, 0, 1)
 
-구현 메커니즘:
-    diffusers 의 attn_ref.processor 를 SteeredReferenceAttnProcessor 로 교체.
-    Steerer 의 컨텍스트(`apply_steering()`) 진입 시 교체, 종료 시 원복.
+mask 전달 방법:
+    steerer.set_batch_face_masks([mask1, mask2, ...])   # [tile_h, tile_w] float or None
+    with steerer.apply_steering():
+        infer_batch(...)
+    steerer.clear_batch_face_masks()
+
+    mask=None 인 tile → 해당 tile 의 모든 query token 에 개입 없음 (no-op).
+    mask=ones   인 tile → 모든 query token 에 개입 적용 (FMT matched tile 용).
 """
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -50,10 +54,11 @@ class SteeredReferenceAttnProcessor:
     """
     drop-in replacement for ReferenceAttnProcessorWithZeroConvolution.
 
-    Trust intervention: pre-softmax logit scaling on all query tokens.
-    Verify intervention: post-sigmoid gate G scaling on all tokens.
+    Trust intervention: pre-softmax logit scaling on mask-selected query tokens.
+    Verify intervention: post-sigmoid gate G scaling on mask-selected tokens.
 
-    when steerer.is_active() == False OR both scales equal 1.0 → SDPA fast-path.
+    mask=None (build_query_mask returns None) → SDPA fast-path, identical to original.
+    steerer.is_active()==False → SDPA fast-path.
     """
 
     def __init__(self, steerer: "AICGSteerer"):
@@ -90,7 +95,8 @@ class SteeredReferenceAttnProcessor:
         key   = attn.head_to_batch_dim(attn.to_k(encoder_hidden_states))
         value = attn.head_to_batch_dim(attn.to_v(encoder_hidden_states))
 
-        L_q = query.shape[1]
+        L_q   = query.shape[1]
+        h_eff = query.shape[0] // B
 
         # ── Reference summary (Eq.3~4) ─────────────────────────────────────
         learnable_token  = attn.learnable_token.expand(B, -1, -1)
@@ -104,29 +110,44 @@ class SteeredReferenceAttnProcessor:
         attn_summary = attn.batch_to_head_dim(attn_summary)
         gate         = torch.sigmoid(attn_summary.mean(dim=-1))  # [B, L_q]
 
+        # ── Build per-token mask if steering is active ─────────────────────
         steer = self.steerer.is_active()
+        mask_q_2d: Optional[torch.Tensor] = None   # [B, L_q] bool
+        mask_q_bh: Optional[torch.Tensor] = None   # [B*h, L_q] bool (for trust)
 
-        # ── Verify intervention: apply to ALL gate positions ───────────────
         if steer:
-            if self.steerer.force_verify:
-                gate = torch.ones_like(gate)
-            elif self.steerer.effective_verify_scale != 1.0:
-                gate = (gate * self.steerer.effective_verify_scale).clamp(0.0, 1.0)
+            mask_q_2d = self.steerer.build_query_mask(B=B, L_q=L_q, device=query.device)
+            if mask_q_2d is not None:
+                mask_q_bh = mask_q_2d.repeat_interleave(h_eff, dim=0)
 
-        # ── Main attention (Eq.2) – Trust intervention applied if needed ───
+        # ── Verify intervention: mask 위치에만 gate 조정 ────────────────────
+        if steer and mask_q_2d is not None:
+            if self.steerer.force_verify:
+                forced = torch.ones_like(gate)
+            elif self.steerer.effective_verify_scale != 1.0:
+                forced = (gate * self.steerer.effective_verify_scale).clamp(0.0, 1.0)
+            else:
+                forced = None
+            if forced is not None:
+                gate = torch.where(mask_q_2d, forced, gate)
+
+        # ── Main attention (Eq.2) – Trust intervention if needed ───────────
         chunk_size   = 1024
         output       = torch.zeros_like(query)
-        trust_active = steer and self.steerer.effective_trust_scale != 1.0
-        _viz         = self.steerer.capture_for_viz
+        trust_active = (steer and mask_q_bh is not None
+                        and self.steerer.effective_trust_scale != 1.0)
+        _viz = self.steerer.capture_for_viz
 
         if trust_active:
             ts = self.steerer.effective_trust_scale
             _probs_chunks: List[torch.Tensor] = []
             for i in range(0, L_q, chunk_size):
-                q_chunk = query[:, i:i + chunk_size, :]
-                scores  = torch.bmm(q_chunk, key.transpose(-1, -2)) * attn.scale * ts
-                probs_c = torch.softmax(scores, dim=-1)
-                out_c   = torch.bmm(probs_c, value)
+                q_chunk  = query[:, i:i + chunk_size, :]
+                scores   = torch.bmm(q_chunk, key.transpose(-1, -2)) * attn.scale
+                m_chunk  = mask_q_bh[:, i:i + chunk_size].unsqueeze(-1)  # [B*h, c, 1]
+                scores   = torch.where(m_chunk, scores * ts, scores)
+                probs_c  = torch.softmax(scores, dim=-1)
+                out_c    = torch.bmm(probs_c, value)
                 output[:, i:i + chunk_size, :] = out_c
                 if _viz:
                     _probs_chunks.append(probs_c.detach().cpu())
@@ -176,19 +197,17 @@ class AICGSteerer:
     Trust/Verify intervention 컨트롤러.
 
     사용 패턴 (demo_tiled.py 통합):
-        steerer = AICGSteerer(
-            net_sr.unet,
-            scale=1.0,
-            trust_scale=1.8,
-            verify_scale=2.0,
-            fusion_blocks="full",
-        )
+        steerer = AICGSteerer(net_sr.unet, scale=1.0, trust_scale=1.8, verify_scale=2.0)
 
+        # FMT matched tile 배치:
+        ones = [torch.ones(tile_size, tile_size)] * B
+        steerer.set_batch_face_masks(ones)
         with steerer.apply_steering():
             predictions = infer_batch(...)
+        steerer.clear_batch_face_masks()
 
-    개별 효과 비활성화:
-        scale=1.0, trust_scale=1.0, verify_scale=1.0  → 완전한 no-op
+    mask=None per tile → 해당 tile no-op.
+    mask=ones  per tile → 해당 tile 전체 token 개입.
     """
 
     def __init__(
@@ -208,6 +227,11 @@ class AICGSteerer:
         self.force_verify  = bool(force_verify)
         self.fusion_blocks = fusion_blocks
         self.verbose       = verbose
+
+        # per-batch masks (re-set every tile-batch)
+        self._batch_face_masks: Optional[List[Optional[torch.Tensor]]] = None
+        # query mask cache: keyed by L_q, invalidated on set_batch_face_masks()
+        self._query_mask_cache: Dict[int, Optional[torch.Tensor]] = {}
 
         self.capture_for_viz: bool = False
         self._last_probs: Optional[torch.Tensor] = None
@@ -258,6 +282,69 @@ class AICGSteerer:
         ]
         if self.verbose:
             print(f"[AICGSteerer] attn_ref modules collected: {len(self._attn_ref_modules)}")
+
+    # ── per-batch mask interface ────────────────────────────────────────────
+
+    def set_batch_face_masks(self, masks: List[Optional[torch.Tensor]]):
+        """매 tile-batch 마다 호출. 길이=B, 각 원소는 픽셀 공간 [H, W] mask 또는 None.
+
+        FMT matched tile: torch.ones(tile_size, tile_size) 전달 → 전체 token 개입.
+        No match / 개입 불필요: None 전달 → 해당 tile no-op.
+        """
+        self._batch_face_masks = list(masks)
+        self._query_mask_cache = {}
+
+    def clear_batch_face_masks(self):
+        self._batch_face_masks = None
+        self._query_mask_cache = {}
+
+    def build_query_mask(
+        self,
+        B:      int,
+        L_q:    int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """batch masks 를 attention token 해상도(L_q) 로 다운샘플 → [B, L_q] bool.
+
+        모든 mask 가 None 이면 None 반환 → no-op.
+        결과는 _query_mask_cache[L_q] 에 캐시.
+        """
+        no_mask = (
+            not self._batch_face_masks
+            or all(m is None for m in self._batch_face_masks)
+        )
+        if no_mask:
+            return None
+
+        if L_q in self._query_mask_cache:
+            cached = self._query_mask_cache[L_q]
+            if cached is None:
+                return None
+            if cached.device != device:
+                cached = cached.to(device=device)
+                self._query_mask_cache[L_q] = cached
+            return cached
+
+        ls = int(math.sqrt(L_q))
+        if ls * ls != L_q:
+            self._query_mask_cache[L_q] = None
+            return None
+
+        out = torch.zeros(B, L_q, dtype=torch.bool, device=device)
+        for i in range(min(B, len(self._batch_face_masks))):
+            m = self._batch_face_masks[i]
+            if m is None:
+                continue
+            with torch.no_grad():
+                m_lr = F.interpolate(
+                    m.float().unsqueeze(0).unsqueeze(0).to(device=device),
+                    size=(ls, ls),
+                    mode='area',
+                ).squeeze().reshape(-1)   # [L_q]
+            out[i] = m_lr > 0.5
+
+        self._query_mask_cache[L_q] = out
+        return out
 
     # ── processor swap context manager ──────────────────────────────────────
 
