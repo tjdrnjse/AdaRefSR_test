@@ -20,6 +20,14 @@ align_method:    "wavelet"
 is_image:        True
 enable_xformers: True
 
+# ── Ref-free mode ────────────────────────────────────────────────────────────
+# ref_free: true 이면 ref 이미지 없이 LQ만으로 SR.
+#   - ref_path 불필요.
+#   - net_ref / model_vlm(ref 캡션) 미로드 → VRAM 절약.
+#   - FMT / steering / visualize 자동 비활성.
+#   - 순수 S3Diff SR (ref attention 없음).
+ref_free: false
+
 # ── Tiling settings ──────────────────────────────────────────────────────────
 # tile_size: H=W of each tile sent to the model.
 #   - Set to the model's native resolution (512 by default).

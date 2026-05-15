@@ -106,35 +106,42 @@ def find_file_by_stem(folder, stem):
 # ── Main inference ───────────────────────────────────────────────────────────
 
 def load_models(args, device, weight_dtype):
+    ref_free = bool(getattr(args, 'ref_free', False))
+
     net_sr = GenModel(
         sd_path=args.sd_path,
         pretrained_backbone_path=args.pretrained_backbone_path,
         pretrained_ref_gen_path=args.pretrained_ref_gen_path,
         args=args,
     )
-    net_ref = RefModel(sd_path=args.sd_path)
     net_de  = DEResNet(num_in_ch=3, num_degradation=2)
     net_de.load_model(args.de_net_path)
 
-    model_vlm = ram(
-        pretrained=args.ram_path, image_size=384, vit='swin_l'
-    ).eval().to(device, dtype=torch.float16)
+    # ref_free 모드: net_ref, model_vlm(ref 캡션용) 생략 → VRAM 절약
+    model_vlm = None
+    if not ref_free:
+        model_vlm = ram(
+            pretrained=args.ram_path, image_size=384, vit='swin_l'
+        ).eval().to(device, dtype=torch.float16)
     model_vlm_deg = ram_deg(
         pretrained=args.ram_path, pretrained_condition=args.dape_path,
         image_size=384, vit='swin_l'
     ).eval().to(device, dtype=torch.float16)
 
-    ref_writer = ReferenceNetAttention(
-        net_ref.unet, mode='write', fusion_blocks=args.fusion_blocks,
-        is_image=True, dtype=weight_dtype,
-    )
-    ref_reader = ReferenceNetAttention(
-        net_sr.unet, mode='read', fusion_blocks=args.fusion_blocks,
-        is_image=True, dtype=weight_dtype,
-    )
+    net_ref = ref_writer = ref_reader = None
+    if not ref_free:
+        net_ref = RefModel(sd_path=args.sd_path)
+        ref_writer = ReferenceNetAttention(
+            net_ref.unet, mode='write', fusion_blocks=args.fusion_blocks,
+            is_image=True, dtype=weight_dtype,
+        )
+        ref_reader = ReferenceNetAttention(
+            net_sr.unet, mode='read', fusion_blocks=args.fusion_blocks,
+            is_image=True, dtype=weight_dtype,
+        )
+        net_ref.to(device, dtype=weight_dtype).eval()
 
     net_sr.to(device, dtype=weight_dtype).eval()
-    net_ref.to(device, dtype=weight_dtype).eval()
     net_de.to(device, dtype=weight_dtype).eval()
 
     return net_sr, net_ref, net_de, model_vlm, model_vlm_deg, ref_writer, ref_reader
@@ -184,22 +191,31 @@ def _infer_single_image(lq_path, ref_path, output_path,
     """Process a single (lq, ref) image pair and save the result."""
 
     # ── Load & align original images ─────────────────────────────────────────
+    ref_free = ref_path is None or bool(args.get("ref_free", False))
+    if ref_free and visualize:
+        print("  [ref_free] visualize 비활성 (ref 없이는 Map1/3 생성 불가)")
+        visualize = False
+
     lq_img  = ImageOps.exif_transpose(Image.open(lq_path).convert("RGB"))
-    ref_img = ImageOps.exif_transpose(Image.open(ref_path).convert("RGB"))
 
     orig_w = lq_img.size[0] // 8 * 8
     orig_h = lq_img.size[1] // 8 * 8
     lq_img = lq_img.resize((orig_w, orig_h), Image.BICUBIC)
 
-    ref_img = ref_img.resize(
-        (ref_img.size[0] // 8 * 8, ref_img.size[1] // 8 * 8), Image.BICUBIC
-    )
-
     to_tensor = transforms.ToTensor()
     x_lq_orig = to_tensor(lq_img)   # [3, H,  W ] – original LQ (for RAM prompt)
-    x_ref      = to_tensor(ref_img)  # [3, Hr, Wr] – ref kept at original resolution
 
-    ref_h, ref_w = x_ref.shape[1], x_ref.shape[2]
+    if ref_free:
+        ref_img = None
+        x_ref   = None
+        ref_h = ref_w = 0
+    else:
+        ref_img = ImageOps.exif_transpose(Image.open(ref_path).convert("RGB"))
+        ref_img = ref_img.resize(
+            (ref_img.size[0] // 8 * 8, ref_img.size[1] // 8 * 8), Image.BICUBIC
+        )
+        x_ref   = to_tensor(ref_img)  # [3, Hr, Wr] – ref kept at original resolution
+        ref_h, ref_w = x_ref.shape[1], x_ref.shape[2]
 
     # ── Bicubic upscale LQ by `scale` ────────────────────────────────────────
     sr_h = orig_h * scale // 8 * 8
@@ -225,23 +241,26 @@ def _infer_single_image(lq_path, ref_path, output_path,
 
     # ── Global semantic prompts ───────────────────────────────────────────────
     with torch.no_grad():
-        prompt_ref = inference(
-            ram_transforms(x_ref.unsqueeze(0)).to(device, dtype=torch.float16),
-            model_vlm)[0]
         prompt_src = inference(
             ram_transforms(x_lq_orig.unsqueeze(0)).to(device, dtype=torch.float16),
             model_vlm_deg)[0]
-    print(f"  Prompt (ref): {prompt_ref}")
+        if ref_free:
+            prompt_ref = ""
+        else:
+            prompt_ref = inference(
+                ram_transforms(x_ref.unsqueeze(0)).to(device, dtype=torch.float16),
+                model_vlm)[0]
+            print(f"  Prompt (ref): {prompt_ref}")
     print(f"  Prompt (src): {prompt_src}")
 
-    # ── AICG steering 설정 ────────────────────────────────────────────────────
-    enable_steering   = bool(args.get("enable_steering",    False))
+    # ── AICG steering 설정 (ref_free 시 강제 비활성) ──────────────────────────
+    enable_steering   = bool(args.get("enable_steering",    False)) and not ref_free
     aicg_scale        = float(args.get("aicg_scale",        1.0))
     aicg_trust_scale  = float(args.get("aicg_trust_scale",  1.0))
     aicg_verify_scale = float(args.get("aicg_verify_scale", 1.0))
     aicg_force_verify = bool(args.get("aicg_force_verify",  False))
 
-    enable_full_ref = bool(args.get("enable_full_ref",   False))
+    enable_full_ref = bool(args.get("enable_full_ref",   False)) and not ref_free
     full_ref_size   = int(args.get("full_ref_size",      1024))
 
     # AICGSteerer 초기화
@@ -284,7 +303,10 @@ def _infer_single_image(lq_path, ref_path, output_path,
         # FMT 사용 시에는 타일 매칭 없이 단일 타일이므로 steering 없음.
         _steer_single = (steerer is not None and fmt is None)
 
-        if enable_full_ref:
+        if ref_free:
+            def _run_infer():
+                return infer_sr_only(net_sr, net_de, x_src_t, [prompt_src], weight_dtype)
+        elif enable_full_ref:
             x_ref_t = x_ref_global.unsqueeze(0).to(device, dtype=weight_dtype)
             infer_global_ref(net_ref, ref_writer, ref_reader, x_ref_t, prompt_ref, weight_dtype)
             def _run_infer():
@@ -439,40 +461,44 @@ def _infer_single_image(lq_path, ref_path, output_path,
             lq_tile = x_lq[:, ty:ty + tile_size, tx:tx + tile_size]
             lq_tiles.append(lq_tile)
 
-            if enable_full_ref:
-                tile_coords.append((ty, tx, 0, 0, ref_h_eff, ref_w_eff))
-            elif (ty, tx) in _precomp_crops:
-                # Feature-matching ref crop (pre-computed)
-                ref_tiles.append(_precomp_crops[(ty, tx)])
-                ry, rx, rth, rtw = _precomp_coords[(ty, tx)]
-                tile_coords.append((ty, tx, ry, rx, rth, rtw))
-            else:
-                # Proportional fallback crop
-                ry  = int(ty  * ref_h / lq_h)
-                rx  = int(tx  * ref_w / lq_w)
-                rth = max(1, round(tile_size * ref_h / lq_h))
-                rtw = max(1, round(tile_size * ref_w / lq_w))
-                ry  = min(ry, max(0, ref_h - rth))
-                rx  = min(rx, max(0, ref_w - rtw))
-                ref_crop = x_ref[:, ry : ry + rth, rx : rx + rtw]
-                if rth != tile_size or rtw != tile_size:
-                    ref_crop = F.interpolate(
-                        ref_crop.unsqueeze(0),
-                        size=(tile_size, tile_size),
-                        mode='bicubic', align_corners=False,
-                    ).squeeze(0)
-                ref_tiles.append(ref_crop)
-                tile_coords.append((ty, tx, ry, rx, rth, rtw))
+            if not ref_free:
+                if enable_full_ref:
+                    tile_coords.append((ty, tx, 0, 0, ref_h_eff, ref_w_eff))
+                elif (ty, tx) in _precomp_crops:
+                    # Feature-matching ref crop (pre-computed)
+                    ref_tiles.append(_precomp_crops[(ty, tx)])
+                    ry, rx, rth, rtw = _precomp_coords[(ty, tx)]
+                    tile_coords.append((ty, tx, ry, rx, rth, rtw))
+                else:
+                    # Proportional fallback crop
+                    ry  = int(ty  * ref_h / lq_h)
+                    rx  = int(tx  * ref_w / lq_w)
+                    rth = max(1, round(tile_size * ref_h / lq_h))
+                    rtw = max(1, round(tile_size * ref_w / lq_w))
+                    ry  = min(ry, max(0, ref_h - rth))
+                    rx  = min(rx, max(0, ref_w - rtw))
+                    ref_crop = x_ref[:, ry : ry + rth, rx : rx + rtw]
+                    if rth != tile_size or rtw != tile_size:
+                        ref_crop = F.interpolate(
+                            ref_crop.unsqueeze(0),
+                            size=(tile_size, tile_size),
+                            mode='bicubic', align_corners=False,
+                        ).squeeze(0)
+                    ref_tiles.append(ref_crop)
+                    tile_coords.append((ty, tx, ry, rx, rth, rtw))
 
         x_src_b = torch.stack(lq_tiles).to(device, dtype=weight_dtype)
-        prompts_ref_b = [prompt_ref] * B
         prompts_src_b = [prompt_src] * B
 
-        if enable_full_ref:
+        if ref_free:
+            def _run_batch():
+                return infer_sr_only(net_sr, net_de, x_src_b, prompts_src_b, weight_dtype)
+        elif enable_full_ref:
             def _run_batch():
                 return infer_sr_only(net_sr, net_de, x_src_b, prompts_src_b, weight_dtype)
         else:
             x_ref_b = torch.stack(ref_tiles).to(device, dtype=weight_dtype)
+            prompts_ref_b = [prompt_ref] * B
             def _run_batch():
                 return infer_batch(
                     net_sr, net_ref, net_de, ref_writer, ref_reader,
@@ -540,11 +566,37 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
     visualize  = bool(args.get("visualize",      False))
     vis_out    = args.get("vis_output_path",     None)
 
+    ref_free   = bool(args.get("ref_free", False))
     lq_is_dir  = os.path.isdir(lq_path)
-    ref_is_dir = os.path.isdir(ref_path)
+    ref_is_dir = (not ref_free) and ref_path is not None and os.path.isdir(ref_path)
 
     # ── 처리 대상 쌍 목록 구성 ────────────────────────────────────────────────
-    if lq_is_dir and ref_is_dir:
+    if ref_free:
+        # ref 없이 LQ만 처리: ref_path 불필요
+        if lq_is_dir:
+            lq_files = collect_image_files(lq_path)
+            if not lq_files:
+                raise FileNotFoundError(f"No image files found in lq_path: {lq_path}")
+            os.makedirs(output_path, exist_ok=True)
+            _out_dir_for_cfg = output_path
+            image_pairs = [
+                (os.path.join(lq_path, f), None, os.path.join(output_path, f))
+                for f in lq_files
+            ]
+            print(f">>> Ref-free folder mode: {len(image_pairs)} image(s).")
+        else:
+            if os.path.isdir(output_path):
+                out_file = os.path.join(output_path, os.path.basename(lq_path))
+                _out_dir_for_cfg = output_path
+            else:
+                out_dir = os.path.dirname(output_path)
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                out_file = output_path
+                _out_dir_for_cfg = out_dir or "."
+            image_pairs = [(lq_path, None, out_file)]
+            print(f">>> Ref-free single-image mode: {os.path.basename(lq_path)}")
+    elif lq_is_dir and ref_is_dir:
         lq_files = collect_image_files(lq_path)
         if not lq_files:
             raise FileNotFoundError(f"No image files found in lq_path: {lq_path}")
@@ -614,7 +666,7 @@ def run_demo_tiled(lq_path, ref_path, output_path, args):
 
     # ── FeatureMatchingTiler (XFeat) 로드 ────────────────────────────────────
     fmt = None
-    if bool(args.get("use_feature_matching_tiling", False)):
+    if bool(args.get("use_feature_matching_tiling", False)) and not ref_free:
         xfeat_path = str(args.get("xfeat_project_path", "") or "")
         if xfeat_path and os.path.isdir(xfeat_path):
             from my_utils.feature_matching_tiling import FeatureMatchingTiler
@@ -704,6 +756,12 @@ if __name__ == "__main__":
     demo_parser.add_argument("--xfeat_project_path", type=str, default=None,
                              help="accelerated_features 폴더의 절대/상대 경로.")
 
+    # ── Ref-free mode ────────────────────────────────────────────────────────
+    demo_parser.add_argument("--ref_free", action="store_true", default=None,
+                             help="Ref 이미지 없이 LQ만으로 SR. "
+                                  "net_ref/model_vlm 미로드 → VRAM 절약. "
+                                  "ref_path 불필요.")
+
     demo_args, unknown = demo_parser.parse_known_args()
 
     sys.argv = [sys.argv[0]] + unknown
@@ -719,7 +777,9 @@ if __name__ == "__main__":
                      if v is not None and k != 'config'}
     final_cfg = OmegaConf.merge(base_cfg, OmegaConf.create(cli_overrides))
 
-    for key in ('lq_path', 'ref_path', 'output_path'):
+    _ref_free = bool(final_cfg.get("ref_free", False))
+    required_keys = ['lq_path', 'output_path'] + ([] if _ref_free else ['ref_path'])
+    for key in required_keys:
         if not final_cfg.get(key):
             raise ValueError(
                 f"'{key}' is required. Set it via --{key} or in the YAML config."
@@ -727,4 +787,9 @@ if __name__ == "__main__":
 
     final_cfg.config_path = demo_args.config
 
-    run_demo_tiled(final_cfg.lq_path, final_cfg.ref_path, final_cfg.output_path, final_cfg)
+    run_demo_tiled(
+        final_cfg.lq_path,
+        final_cfg.get("ref_path", None),
+        final_cfg.output_path,
+        final_cfg,
+    )
