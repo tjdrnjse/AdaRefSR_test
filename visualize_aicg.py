@@ -190,13 +190,16 @@ class AICGVisualizer:
         unet,
         roi_mask=None,   # kept for API compatibility (unused – face code removed)
         *,
-        ref_h:         int,
-        ref_w:         int,
-        lq_h:          int,
-        lq_w:          int,
-        tile_size:     int = 512,
-        fusion_blocks: str = "full",
+        ref_h:                int,
+        ref_w:                int,
+        lq_h:                 int,
+        lq_w:                 int,
+        tile_size:            int   = 512,
+        fusion_blocks:        str   = "full",
         steerer=None,  # Optional[AICGSteerer] – inject to use cached probs/gate
+        map1_norm:            str   = "minmax",   # "minmax" | "percentile"
+        map1_percentile_low:  float = 2.0,
+        map1_percentile_high: float = 98.0,
     ):
         self.unet      = unet
         self.steerer   = steerer   # if provided, hook reads steerer._last_probs/_last_gate
@@ -205,6 +208,9 @@ class AICGVisualizer:
         self.lq_h      = lq_h
         self.lq_w      = lq_w
         self.tile_size = tile_size
+        self.map1_norm            = map1_norm
+        self.map1_percentile_low  = map1_percentile_low
+        self.map1_percentile_high = map1_percentile_high
 
         # Map1, Map3 → Ref 공간 캔버스
         self.canvas1  = torch.zeros(ref_h, ref_w)
@@ -388,22 +394,25 @@ class AICGVisualizer:
         m1, m2, m3 = acc.mean()
 
         # ── Map1, Map3 → Ref 캔버스 ──────────────────────────────────────────
-        def to_2d_ref(vec: torch.Tensor) -> torch.Tensor:
+        def to_2d_ref(vec: torch.Tensor, normalize: bool = True) -> torch.Tensor:
             l  = vec.shape[0]
             ls = int(math.sqrt(l))
             if ls * ls != l:
                 ls = self.tile_size // 8
                 l  = ls * ls
             v  = vec.cpu().float()[:l].reshape(1, 1, ls, ls)
-            mn, mx = v.min(), v.max()
-            v  = (v - mn) / (mx - mn + 1e-8)
+            if normalize:
+                mn, mx = v.min(), v.max()
+                v  = (v - mn) / (mx - mn + 1e-8)
             return F.interpolate(
                 v, size=(rth, rtw), mode='bilinear', align_corners=False
             ).squeeze()
 
         r0, r1 = ref_ry, ref_ry + rth
         c0, c1 = ref_rx, ref_rx + rtw
-        self.canvas1[r0:r1, c0:c1] += to_2d_ref(m1)
+        # percentile 모드: Map1 raw 값 그대로 누적 (finalize에서 전체 맵 기준 clip)
+        m1_per_tile_norm = (self.map1_norm != 'percentile')
+        self.canvas1[r0:r1, c0:c1] += to_2d_ref(m1, normalize=m1_per_tile_norm)
         self.canvas3[r0:r1, c0:c1] += to_2d_ref(m3)
         self.cnt_ref[r0:r1, c0:c1] += 1.0
         self._ref_crops.append((ref_ry, ref_rx, rth, rtw))
@@ -502,7 +511,14 @@ class AICGVisualizer:
                      hm_rgb.astype(np.float32) * 0.5)
                     .clip(0, 255).astype(np.uint8))
 
-        b1 = blend(g1, ref_img, is_gate=False)   # [ref_h, ref_w, 3]
+        # Map1: percentile 모드이면 전체 맵 기준 percentile clip 후 [0,1] 정규화
+        if self.map1_norm == 'percentile':
+            lo = np.percentile(g1, self.map1_percentile_low)
+            hi = np.percentile(g1, self.map1_percentile_high)
+            g1_n = (g1.clip(lo, hi) - lo) / (hi - lo + 1e-8)
+            b1 = blend(g1_n, ref_img, is_gate=True)  # 이미 [0,1] 정규화됨
+        else:
+            b1 = blend(g1, ref_img, is_gate=False)   # [ref_h, ref_w, 3]
         b2 = blend(g2, lq_img,  is_gate=True)    # [lq_h,  lq_w,  3]
         b3 = blend(g3, ref_img, is_gate=False)   # [ref_h, ref_w, 3]
 

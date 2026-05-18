@@ -333,6 +333,9 @@ def _infer_single_image(lq_path, ref_path, output_path,
                 tile_size=tile_size,
                 fusion_blocks=args.get("fusion_blocks", "full"),
                 steerer=steerer,
+                map1_norm=args.get("map1_norm", "minmax"),
+                map1_percentile_low=args.get("map1_percentile_low", 2.0),
+                map1_percentile_high=args.get("map1_percentile_high", 98.0),
             )
             with viz.capture_tile(0, 0, 0, 0, ref_h_eff, ref_w_eff, lq_h, lq_w):
                 if _steer_single:
@@ -409,6 +412,9 @@ def _infer_single_image(lq_path, ref_path, output_path,
             tile_size=tile_size,
             fusion_blocks=args.get("fusion_blocks", "full"),
             steerer=steerer,
+            map1_norm=args.get("map1_norm", "minmax"),
+            map1_percentile_low=args.get("map1_percentile_low", 2.0),
+            map1_percentile_high=args.get("map1_percentile_high", 98.0),
         )
 
     # ── Full Ref Attention 모드: ref 1회만 forward ────────────────────────────

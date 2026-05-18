@@ -67,6 +67,18 @@ visualize: false
 #   - null 로 두면 output_path 와 동일 디렉터리에 "<파일명>_aicg_vis.png" 로 자동 저장.
 vis_output_path: null   # 예) "./assets/results/img_aicg_vis.png"
 
+# map1_norm: Map1(Trust) 정규화 방법.
+#   - minmax     : (기본) 타일별 min-max 정규화 후 누적 → finalize 시 전체 맵 min-max.
+#   - percentile : raw 값 그대로 누적 → finalize 시 전체 맵 기준 percentile clip 후 정규화.
+#                  outlier 에 강건하며 미세한 attention 분포 차이를 더 잘 드러낸다.
+map1_norm: minmax
+
+# map1_percentile_low / map1_percentile_high: percentile 모드에서 clip 범위 (0~100).
+#   - 기본값 2.0 / 98.0: 상하위 2% outlier 제거.
+#   - 더 공격적 clip 원하면 5.0 / 95.0 등 시도.
+map1_percentile_low:  2.0
+map1_percentile_high: 98.0
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AICG Steering (FMT-matched tile 에 대한 Trust/Verify 강화)
 # ─────────────────────────────────────────────────────────────────────────────
